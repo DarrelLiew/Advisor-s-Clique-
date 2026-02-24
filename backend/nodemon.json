@@ -1,0 +1,6 @@
+{
+  "watch": ["src"],
+  "ext": "ts,json",
+  "exec": "ts-node src/index.ts",
+  "nodeArgs": ["--max-old-space-size=2048"]
+}
