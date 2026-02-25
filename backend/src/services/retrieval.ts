@@ -49,7 +49,7 @@ export async function rewriteQueryForRetrieval(openai: OpenAI, queryText: string
 
 function heuristicDomainClassification(_query: string): DomainClassification {
   // Conservative fallback when LLM classification fails — default to in-domain.
-  return { in_domain: true, reason: 'Defaulting to in-domain — LLM classification unavailable.' };
+  return { in_domain: true, is_financial: true, reason: 'Defaulting to in-domain — LLM classification unavailable.' };
 }
 
 export async function classifyQueryDomain(openai: OpenAI, queryText: string): Promise<DomainClassification> {
@@ -60,15 +60,17 @@ export async function classifyQueryDomain(openai: OpenAI, queryText: string): Pr
         {
           role: 'system',
           content:
-            'Classify whether a query is related to financial advisory, wealth management, banking, insurance, compliance, investments, client services, or general financial/business concepts. ' +
-            'Mark as out-of-domain ONLY if the query has absolutely no connection to finance, business, or professional services (e.g., cooking recipes, sports team scores, entertainment news, weather forecasts). ' +
-            'Financial questions — even general ones like what a GIC is, how bonds work, or tax concepts — are in-domain. When in doubt, mark as in-domain. ' +
-            'Return strict JSON only: {"in_domain": boolean, "reason": string}.',
+            'You are a query classifier for a financial advisory assistant. Classify each query into one of three tiers:\n' +
+            '1. in_domain=true, is_financial=true: Query is related to topics likely covered in uploaded advisory documents (compliance, products, client processes, regulations, internal procedures).\n' +
+            '2. in_domain=false, is_financial=true: Query is a general finance/business question (e.g. "What is a GIC?", "How do bonds work?", "What is MER?") — relevant to advisory work but unlikely to be in uploaded docs.\n' +
+            '3. in_domain=false, is_financial=false: Query has NO connection to finance, business, or professional advisory work (e.g. sports scores, cooking, weather, entertainment). These should be rejected.\n' +
+            'When in doubt between tier 1 and 2, choose tier 1. Only use tier 3 for clearly non-professional, non-financial topics.\n' +
+            'Return strict JSON only: {"in_domain": boolean, "is_financial": boolean, "reason": string}.',
         },
         { role: 'user', content: queryText },
       ],
       temperature: 0,
-      max_tokens: 120,
+      max_tokens: 150,
     });
 
     const raw = completion.choices[0].message.content?.trim();
@@ -85,6 +87,7 @@ export async function classifyQueryDomain(openai: OpenAI, queryText: string): Pr
 
     return {
       in_domain: parsed.in_domain,
+      is_financial: typeof parsed.is_financial === 'boolean' ? parsed.is_financial : true,
       reason: typeof parsed.reason === 'string' && parsed.reason.trim().length > 0
         ? parsed.reason
         : 'Domain classified by model.',

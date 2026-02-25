@@ -82,23 +82,35 @@ router.post(
       const startTime = Date.now();
       const queryText = query.trim();
 
-      // 1. Classify domain — determines whether to attempt document retrieval
+      // 1. Classify domain — three-tier: in-docs / financial-general / off-topic
       const domain = await classifyQueryDomain(openai, queryText);
       let usedWebFallback = false;
       let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
 
+      if (!domain.in_domain && !domain.is_financial) {
+        // 2a. Completely off-topic — reject with scope message
+        const responseTime = Date.now() - startTime;
+        const rejectionMsg = "I'm here to help with financial advisory topics. That question falls outside the scope of this assistant.";
+        console.log(`[RAG][chat] rejected query="${queryText}" reason="${domain.reason}"`);
+
+        await supabase.from('chat_messages').insert({ user_id: userId, query, response: rejectionMsg, sources: [] });
+        logQueryAnalytics({ userId, queryText: query, responseTimeMs: responseTime, metadata: { outcome: 'rejected', reason: domain.reason } });
+
+        return res.json({ answer: rejectionMsg, sources: [], response_time_ms: responseTime, chat_saved: true });
+      }
+
       if (domain.in_domain) {
-        // 2a. In-domain: attempt retrieval from uploaded documents
+        // 2b. Likely in documents — attempt retrieval
         retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat' });
         if (!retrieval.context) {
-          // No relevant document chunks found — fall back to general knowledge
+          // No relevant chunks found — fall through to web fallback
           usedWebFallback = true;
           console.log(`[RAG][chat] no_relevant_chunks query="${queryText}" rewritten="${retrieval.rewrittenQuery}"`);
         }
       } else {
-        // 2b. Out-of-domain: skip retrieval, answer from general knowledge
+        // 2c. Financial topic but not in docs — web fallback directly
         usedWebFallback = true;
-        console.log(`[RAG][chat] out_of_domain_web_fallback query="${queryText}" reason="${domain.reason}"`);
+        console.log(`[RAG][chat] financial_web_fallback query="${queryText}" reason="${domain.reason}"`);
       }
 
       // 3. Build system prompt
@@ -115,7 +127,7 @@ Key instructions:
 
 Context from documents:
 ${retrieval!.context}`
-        : `You are a knowledgeable financial advisory assistant. The uploaded documents do not contain relevant information for this query, so answer using your general knowledge.
+        : `You are a knowledgeable financial advisory assistant. This question is not covered in the uploaded documents, so answer using your general knowledge.
 Start your response with the label "[Web]" on its own line to clearly indicate this answer is not sourced from the uploaded documents.
 Be concise, accurate, and helpful.`;
 

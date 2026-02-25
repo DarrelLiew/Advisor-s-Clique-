@@ -132,10 +132,17 @@ async function handleQuery(
   const userId = profile.id;
   const startTime = Date.now();
 
-  // 1. Classify domain — determines whether to attempt document retrieval
+  // 1. Classify domain — three-tier: in-docs / financial-general / off-topic
   const domain = await classifyQueryDomain(openai, queryText);
   let usedWebFallback = false;
   let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
+
+  if (!domain.in_domain && !domain.is_financial) {
+    // Completely off-topic — reject
+    await sendMessage(chatId, "I'm here to help with financial advisory topics. That question falls outside the scope of this assistant.");
+    logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'rejected', reason: domain.reason } });
+    return;
+  }
 
   if (domain.in_domain) {
     retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram' });
@@ -143,6 +150,7 @@ async function handleQuery(
       usedWebFallback = true;
     }
   } else {
+    // Financial topic but not in docs — web fallback
     usedWebFallback = true;
   }
 
@@ -253,7 +261,7 @@ Plain text only. No markdown. Be concise and accurate.`;
     responseTimeMs: responseTime,
     metadata: {
       outcome: usedWebFallback ? 'web_fallback' : 'success',
-      rewritten_query: retrieval?.rewrittenQuery,
+      rewritten_query: retrieval?.rewrittenQuery ?? null,
       chunks_retrieved: retrieval?.chunks.length ?? 0,
       source_count: retrieval?.sources.length ?? 0,
     },
