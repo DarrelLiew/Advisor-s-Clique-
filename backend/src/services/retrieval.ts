@@ -19,6 +19,7 @@ type RetrievalSource = {
 
 type DomainClassification = {
   in_domain: boolean;
+  is_financial: boolean; // true = finance/business topic (may use [Web] fallback); false = completely off-topic (reject)
   reason: string;
 };
 
@@ -46,14 +47,9 @@ export async function rewriteQueryForRetrieval(openai: OpenAI, queryText: string
   }
 }
 
-function heuristicDomainClassification(query: string): DomainClassification {
-  const q = query.toLowerCase();
-  const clearlyOffTopicPattern =
-    /\b(weather|temperature|forecast|sports|score|movie times?|traffic|news|headlines|stock market|bitcoin price|crypto price|exchange rate|breaking news)\b/;
-
-  return clearlyOffTopicPattern.test(q)
-    ? { in_domain: false, reason: 'Query appears unrelated to uploaded documents or requests live external data.' }
-    : { in_domain: true, reason: 'Treat as in-domain unless clearly unrelated.' };
+function heuristicDomainClassification(_query: string): DomainClassification {
+  // Conservative fallback when LLM classification fails — default to in-domain.
+  return { in_domain: true, reason: 'Defaulting to in-domain — LLM classification unavailable.' };
 }
 
 export async function classifyQueryDomain(openai: OpenAI, queryText: string): Promise<DomainClassification> {
@@ -64,9 +60,9 @@ export async function classifyQueryDomain(openai: OpenAI, queryText: string): Pr
         {
           role: 'system',
           content:
-            'Classify whether a query should be answered using uploaded documents. ' +
-            'Mark as out-of-domain only when the user is clearly asking for unrelated general knowledge or live external data (for example weather, sports scores, or current market prices). ' +
-            'If the question could plausibly be answered from uploaded documents, mark it in-domain. ' +
+            'Classify whether a query is related to financial advisory, wealth management, banking, insurance, compliance, investments, client services, or general financial/business concepts. ' +
+            'Mark as out-of-domain ONLY if the query has absolutely no connection to finance, business, or professional services (e.g., cooking recipes, sports team scores, entertainment news, weather forecasts). ' +
+            'Financial questions — even general ones like what a GIC is, how bonds work, or tax concepts — are in-domain. When in doubt, mark as in-domain. ' +
             'Return strict JSON only: {"in_domain": boolean, "reason": string}.',
         },
         { role: 'user', content: queryText },

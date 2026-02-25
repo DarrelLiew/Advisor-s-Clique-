@@ -4,7 +4,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { supabase } from '../lib/supabase';
-import { retrieveContextForQuery } from '../services/retrieval';
+import { classifyQueryDomain, retrieveContextForQuery } from '../services/retrieval';
 import { telegramLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
@@ -131,13 +131,23 @@ async function handleQuery(
 
   const userId = profile.id;
   const startTime = Date.now();
-  const retrieval = await retrieveContextForQuery({
-    openai,
-    queryText,
-    logLabel: 'telegram',
-  });
 
-  const systemPrompt = retrieval.context
+  // 1. Classify domain — determines whether to attempt document retrieval
+  const domain = await classifyQueryDomain(openai, queryText);
+  let usedWebFallback = false;
+  let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
+
+  if (domain.in_domain) {
+    retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram' });
+    if (!retrieval.context) {
+      usedWebFallback = true;
+    }
+  } else {
+    usedWebFallback = true;
+  }
+
+  // 2. Build system prompt
+  const systemPrompt = !usedWebFallback && retrieval?.context
     ? `You are an AI assistant for uploaded documents. Answer using only the provided documents.
 
 FORMAT YOUR RESPONSE EXACTLY LIKE THIS EXAMPLE:
@@ -158,8 +168,10 @@ RULES:
 - If no relevant information is found, reply only: "I could not find relevant information for that query in the uploaded documents. Please try rephrasing."
 
 Context from documents:
-${retrieval.context}`
-    : `You are an AI assistant for uploaded documents. No relevant document sections were found. Reply: "I could not find relevant information for that query in the uploaded documents. Please try rephrasing."`;
+${retrieval!.context}`
+    : `You are a knowledgeable financial advisory assistant. Answer from your general knowledge.
+Start your response with "[Web]" to indicate this answer is not from uploaded documents.
+Plain text only. No markdown. Be concise and accurate.`;
 
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -174,60 +186,57 @@ ${retrieval.context}`
   const answer = completion.choices[0].message.content ?? 'No response generated.';
   const responseTime = Date.now() - startTime;
 
-  const citedSources: Array<{ filename: string; page: number; document_id: string }> = [];
-  const sourceLineRegex = /Source:\s*(.+?),\s*Page\s*(\d+)/gi;
-  let match: RegExpExecArray | null;
+  // 3. Build inline keyboard buttons (only for document-sourced answers)
+  let replyMarkup: object | undefined;
 
-  while ((match = sourceLineRegex.exec(answer)) !== null) {
-    const citedFilename = match[1].trim();
-    const citedPage = parseInt(match[2], 10);
+  if (!usedWebFallback && retrieval) {
+    const citedSources: Array<{ filename: string; page: number; document_id: string }> = [];
+    const sourceLineRegex = /Source:\s*(.+?),\s*Page\s*(\d+)/gi;
+    let match: RegExpExecArray | null;
 
-    // Search ALL retrieved chunks (not just those above minSourceSimilarity)
-    // so every page the LLM cites can be linked — even lower-similarity matches
-    const matchedChunk = retrieval.chunks.find(
-      (c) => c.filename.toLowerCase() === citedFilename.toLowerCase() && c.page_number === citedPage
-    );
+    while ((match = sourceLineRegex.exec(answer)) !== null) {
+      const citedFilename = match[1].trim();
+      const citedPage = parseInt(match[2], 10);
 
-    const alreadyAdded = citedSources.some(
-      (c) => c.filename === citedFilename && c.page === citedPage
-    );
+      const matchedChunk = retrieval.chunks.find(
+        (c) => c.filename.toLowerCase() === citedFilename.toLowerCase() && c.page_number === citedPage
+      );
+      const alreadyAdded = citedSources.some(
+        (c) => c.filename === citedFilename && c.page === citedPage
+      );
 
-    if (matchedChunk && !alreadyAdded) {
-      citedSources.push({
-        filename: matchedChunk.filename,
-        page: matchedChunk.page_number,
-        document_id: matchedChunk.document_id,
-      });
+      if (matchedChunk && !alreadyAdded) {
+        citedSources.push({
+          filename: matchedChunk.filename,
+          page: matchedChunk.page_number,
+          document_id: matchedChunk.document_id,
+        });
+      }
     }
+
+    const buttons: Array<{ text: string; url: string }> = [];
+    for (const source of citedSources) {
+      const signedUrl = await getSignedDocumentUrl(source.document_id);
+      if (!signedUrl) continue;
+
+      const label = source.filename.length > 20
+        ? source.filename.replace(/\.[^.]+$/, '').slice(0, 17) + '...'
+        : source.filename.replace(/\.[^.]+$/, '');
+
+      const frontendUrl = process.env.FRONTEND_URL;
+      const buttonUrl = frontendUrl && frontendUrl.startsWith('https://')
+        ? `${frontendUrl}/view-document?url=${encodeURIComponent(signedUrl)}&page=${source.page}`
+        : `${signedUrl}#page=${source.page}`;
+
+      buttons.push({ text: `${label} p.${source.page}`, url: buttonUrl });
+    }
+
+    const inline_keyboard: Array<Array<{ text: string; url: string }>> = [];
+    for (let i = 0; i < buttons.length; i += 2) {
+      inline_keyboard.push(buttons.slice(i, i + 2));
+    }
+    replyMarkup = inline_keyboard.length > 0 ? { inline_keyboard } : undefined;
   }
-
-  const buttons: Array<{ text: string; url: string }> = [];
-
-  for (const source of citedSources) {
-    const signedUrl = await getSignedDocumentUrl(source.document_id);
-    if (!signedUrl) continue;
-
-    const label = source.filename.length > 20
-      ? source.filename.replace(/\.[^.]+$/, '').slice(0, 17) + '...'
-      : source.filename.replace(/\.[^.]+$/, '');
-
-    const frontendUrl = process.env.FRONTEND_URL;
-    const buttonUrl = frontendUrl && frontendUrl.startsWith('https://')
-      ? `${frontendUrl}/view-document?url=${encodeURIComponent(signedUrl)}&page=${source.page}`
-      : `${signedUrl}#page=${source.page}`;
-
-    buttons.push({
-      text: `${label} p.${source.page}`,
-      url: buttonUrl,
-    });
-  }
-
-  const inline_keyboard: Array<Array<{ text: string; url: string }>> = [];
-  for (let i = 0; i < buttons.length; i += 2) {
-    inline_keyboard.push(buttons.slice(i, i + 2));
-  }
-
-  const replyMarkup = inline_keyboard.length > 0 ? { inline_keyboard } : undefined;
 
   await sendLongMessage(chatId, answer, replyMarkup);
 
@@ -235,7 +244,7 @@ ${retrieval.context}`
     user_id: userId,
     query: queryText,
     response: answer,
-    sources: retrieval.sources,
+    sources: retrieval?.sources ?? [],
   });
 
   logQueryAnalytics({
@@ -243,9 +252,10 @@ ${retrieval.context}`
     queryText,
     responseTimeMs: responseTime,
     metadata: {
-      rewritten_query: retrieval.rewrittenQuery,
-      chunks_retrieved: retrieval.chunks.length,
-      source_count: retrieval.sources.length,
+      outcome: usedWebFallback ? 'web_fallback' : 'success',
+      rewritten_query: retrieval?.rewrittenQuery,
+      chunks_retrieved: retrieval?.chunks.length ?? 0,
+      source_count: retrieval?.sources.length ?? 0,
     },
   });
 }

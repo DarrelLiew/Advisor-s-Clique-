@@ -57,9 +57,6 @@ function formatAnswer(answer: string): string {
   return formatted;
 }
 
-const OUT_OF_DOMAIN_MESSAGE =
-  "I can answer questions about your uploaded documents. I can't help with unrelated or live external topics (for example, current stock market updates).";
-
 const MAX_QUERY_LENGTH = 2000;
 
 // Send chat message
@@ -85,47 +82,27 @@ router.post(
       const startTime = Date.now();
       const queryText = query.trim();
 
-      // 1. Broad relevance gate (reject only clearly unrelated/live-data queries)
+      // 1. Classify domain — determines whether to attempt document retrieval
       const domain = await classifyQueryDomain(openai, queryText);
-      if (!domain.in_domain) {
-        const responseTime = Date.now() - startTime;
-        console.log(`[RAG][chat] domain_gate_reject query="${queryText}" reason="${domain.reason}"`);
+      let usedWebFallback = false;
+      let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
 
-        const { error: insertError } = await supabase.from('chat_messages').insert({
-          user_id: userId,
-          query,
-          response: OUT_OF_DOMAIN_MESSAGE,
-          sources: [],
-        });
-        const chatSaved = !insertError;
-        if (insertError) {
-          console.error('Failed to save chat message (domain gate):', insertError);
+      if (domain.in_domain) {
+        // 2a. In-domain: attempt retrieval from uploaded documents
+        retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat' });
+        if (!retrieval.context) {
+          // No relevant document chunks found — fall back to general knowledge
+          usedWebFallback = true;
+          console.log(`[RAG][chat] no_relevant_chunks query="${queryText}" rewritten="${retrieval.rewrittenQuery}"`);
         }
-
-        logQueryAnalytics({
-          userId,
-          queryText: query,
-          responseTimeMs: responseTime,
-          metadata: { outcome: 'domain_gate_reject' },
-        });
-
-        return res.json({
-          answer: OUT_OF_DOMAIN_MESSAGE,
-          sources: [],
-          response_time_ms: responseTime,
-          chat_saved: chatSaved,
-        });
+      } else {
+        // 2b. Out-of-domain: skip retrieval, answer from general knowledge
+        usedWebFallback = true;
+        console.log(`[RAG][chat] out_of_domain_web_fallback query="${queryText}" reason="${domain.reason}"`);
       }
 
-      // 2. Query rewrite + embedding + retrieval
-      const retrieval = await retrieveContextForQuery({
-        openai,
-        queryText,
-        logLabel: 'chat',
-      });
-
-      // 3. Build prompt and call OpenAI
-      const systemPrompt = retrieval.context
+      // 3. Build system prompt
+      const systemPrompt = !usedWebFallback && retrieval?.context
         ? `You are an AI assistant for uploaded documents. You answer questions strictly based on the documents provided below.
 
 Key instructions:
@@ -137,12 +114,10 @@ Key instructions:
 - If the documents do not contain the answer, say so directly and briefly.
 
 Context from documents:
-${retrieval.context}`
-        : `You are an AI assistant for uploaded documents. No relevant sections were found in the uploaded documents for this query. Let the user know briefly and suggest they rephrase or ask about content likely covered in the uploaded documents.`;
-
-      if (!retrieval.context) {
-        console.log(`[RAG][chat] no_relevant_chunks query="${queryText}" rewritten="${retrieval.rewrittenQuery}"`);
-      }
+${retrieval!.context}`
+        : `You are a knowledgeable financial advisory assistant. The uploaded documents do not contain relevant information for this query, so answer using your general knowledge.
+Start your response with the label "[Web]" on its own line to clearly indicate this answer is not sourced from the uploaded documents.
+Be concise, accurate, and helpful.`;
 
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -157,30 +132,41 @@ ${retrieval.context}`
       const answer = completion.choices[0].message.content ?? 'No response generated.';
       const responseTime = Date.now() - startTime;
 
-      // Post-process answer: bold citations and filter sources
-      const citedPages = extractCitedPages(answer);
-      let processedAnswer = boldCitations(answer);
-      processedAnswer = formatAnswer(processedAnswer);
+      let processedAnswer: string;
+      let filteredSources: Array<{ filename: string; page: number; similarity: number; document_id: string }>;
+      let analyticsOutcome: string;
 
-      // Build source candidates from ALL retrieved chunks (not just those above
-      // minSourceSimilarity) so that every page the LLM cites can be linked back.
-      const allChunkSources = (() => {
-        const seen = new Set<string>();
-        const result: Array<{ filename: string; page: number; similarity: number; document_id: string }> = [];
-        for (const c of retrieval.chunks) {
-          const key = `${c.filename}:${c.page_number}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          result.push({
-            filename: c.filename,
-            page: c.page_number,
-            similarity: Math.round(c.similarity * 100) / 100,
-            document_id: c.document_id,
-          });
-        }
-        return result;
-      })();
-      const filteredSources = filterSourcesByCitations(allChunkSources, citedPages);
+      if (usedWebFallback) {
+        // Web fallback: no citation processing, just format for readability
+        processedAnswer = formatAnswer(answer);
+        filteredSources = [];
+        analyticsOutcome = 'web_fallback';
+      } else {
+        // Document-sourced: process inline citations and filter sources
+        const citedPages = extractCitedPages(answer);
+        processedAnswer = boldCitations(answer);
+        processedAnswer = formatAnswer(processedAnswer);
+
+        // Build source candidates from ALL retrieved chunks so every cited page can be linked
+        const allChunkSources = (() => {
+          const seen = new Set<string>();
+          const result: Array<{ filename: string; page: number; similarity: number; document_id: string }> = [];
+          for (const c of retrieval!.chunks) {
+            const key = `${c.filename}:${c.page_number}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            result.push({
+              filename: c.filename,
+              page: c.page_number,
+              similarity: Math.round(c.similarity * 100) / 100,
+              document_id: c.document_id,
+            });
+          }
+          return result;
+        })();
+        filteredSources = filterSourcesByCitations(allChunkSources, citedPages);
+        analyticsOutcome = 'success';
+      }
 
       // 4. Save to chat history
       const { error: insertError } = await supabase.from('chat_messages').insert({
@@ -200,8 +186,9 @@ ${retrieval.context}`
         queryText: query,
         responseTimeMs: responseTime,
         metadata: {
-          rewritten_query: retrieval.rewrittenQuery,
-          chunks_retrieved: retrieval.chunks.length,
+          outcome: analyticsOutcome,
+          rewritten_query: retrieval?.rewrittenQuery,
+          chunks_retrieved: retrieval?.chunks.length ?? 0,
           source_count: filteredSources.length,
         },
       });
