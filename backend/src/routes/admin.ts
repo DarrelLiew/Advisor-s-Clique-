@@ -292,6 +292,54 @@ router.delete('/documents/:id', async (req: AuthenticatedRequest, res) => {
   }
 });
 
+// Re-process document (re-chunk and re-embed with current ragConfig settings)
+router.post('/documents/:id/reprocess', async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: document, error: fetchError } = await supabase
+      .from('documents')
+      .select('id, file_path, processing_status')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !document) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    if (document.processing_status === 'processing') {
+      return res.status(409).json({ error: 'Document is already being processed' });
+    }
+
+    // Delete existing chunks
+    const { error: chunksError } = await supabase
+      .from('document_chunks')
+      .delete()
+      .eq('document_id', id);
+
+    if (chunksError) throw chunksError;
+
+    // Reset status to pending
+    const { error: resetError } = await supabase
+      .from('documents')
+      .update({ processing_status: 'pending', error_message: null })
+      .eq('id', id);
+
+    if (resetError) throw resetError;
+
+    // Re-trigger processing asynchronously
+    processDocument(id, document.file_path)
+      .catch((error) => {
+        console.error('Document reprocess failed:', error);
+      });
+
+    res.json({ success: true, message: 'Reprocessing started' });
+  } catch (error: any) {
+    console.error('Reprocess document error:', error);
+    res.status(500).json({ error: 'Failed to start reprocessing' });
+  }
+});
+
 // Dashboard stats
 router.get('/dashboard/stats', async (req: AuthenticatedRequest, res) => {
   try {

@@ -99,18 +99,12 @@ router.post(
         return res.json({ answer: rejectionMsg, sources: [], response_time_ms: responseTime, chat_saved: true });
       }
 
-      if (domain.in_domain) {
-        // 2b. Likely in documents — attempt retrieval
-        retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat' });
-        if (!retrieval.context) {
-          // No relevant chunks found — fall through to web fallback
-          usedWebFallback = true;
-          console.log(`[RAG][chat] no_relevant_chunks query="${queryText}" rewritten="${retrieval.rewrittenQuery}"`);
-        }
-      } else {
-        // 2c. Financial topic but not in docs — web fallback directly
+      // 2b. Always attempt retrieval for any financial query — let vector search decide
+      // (classifier can't know if a specific product/term is in uploaded docs)
+      retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat' });
+      if (!retrieval.context) {
         usedWebFallback = true;
-        console.log(`[RAG][chat] financial_web_fallback query="${queryText}" reason="${domain.reason}"`);
+        console.log(`[RAG][chat] no_chunks_found query="${queryText}" in_domain=${domain.in_domain} reason="${domain.reason}"`);
       }
 
       // 3. Build system prompt
@@ -123,6 +117,7 @@ Key instructions:
 - Format using markdown. Use bullet points or numbered lists.
 - CRITICAL: After EACH specific fact, claim, or bullet point, immediately add an inline citation showing the page number in square brackets (e.g., [p.5] or [p.3-4]). Use the page numbers from the context headers above.
 - Do NOT list sources at the end - citations must be inline next to each point.
+- If the answer involves a table (e.g., premium tiers, rate schedules, benefit schedules), include ALL rows you can find in the context. If the table appears incomplete or cut off, add: "Note: This table may be partial — please verify in the source document."
 - If the documents do not contain the answer, say so directly and briefly.
 
 Context from documents:

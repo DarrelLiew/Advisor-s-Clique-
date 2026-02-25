@@ -21,7 +21,6 @@ export function logQueryAnalytics(params: AnalyticsLogParams): void {
       user_id: userId,
       query_text: queryText,
       response_time_ms: responseTimeMs,
-      metadata: metadata ?? {},
     })
     .then(({ error }) => {
       if (error) {

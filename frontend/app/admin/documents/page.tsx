@@ -8,6 +8,7 @@ import {
   XCircle,
   Clock,
   Trash2,
+  RefreshCw,
 } from "lucide-react";
 import { api, SessionExpiredError } from "@/lib/api";
 import { useRouter } from "next/navigation";
@@ -118,6 +119,23 @@ export default function DocumentsPage() {
       }
       console.error("Delete error:", error);
       setPageMessage({ type: "error", text: "Failed to delete document." });
+    }
+  };
+
+  const handleReprocess = async (id: string) => {
+    if (!confirm("Re-process this document? Existing chunks will be deleted and re-embedded with the current chunk settings.")) return;
+
+    try {
+      await api.post(`/api/admin/documents/${id}/reprocess`, {});
+      await loadDocuments();
+      setPageMessage({ type: "success", text: "Reprocessing started — status will update automatically." });
+    } catch (error: any) {
+      if (error instanceof SessionExpiredError) {
+        router.push("/login");
+        return;
+      }
+      console.error("Reprocess error:", error);
+      setPageMessage({ type: "error", text: error.message || "Failed to start reprocessing." });
     }
   };
 
@@ -237,12 +255,23 @@ export default function DocumentsPage() {
                     {new Date(doc.uploaded_at).toLocaleDateString()}
                   </td>
                   <td className='px-6 py-4 text-right'>
-                    <button
-                      onClick={() => handleDelete(doc.id)}
-                      className='text-red-600 hover:text-red-800'
-                    >
-                      <Trash2 className='w-4 h-4' />
-                    </button>
+                    <div className='flex items-center justify-end gap-3'>
+                      {doc.processing_status === 'ready' && (
+                        <button
+                          onClick={() => handleReprocess(doc.id)}
+                          title='Re-process with current chunk settings'
+                          className='text-gray-400 hover:text-blue-600'
+                        >
+                          <RefreshCw className='w-4 h-4' />
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleDelete(doc.id)}
+                        className='text-red-600 hover:text-red-800'
+                      >
+                        <Trash2 className='w-4 h-4' />
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}

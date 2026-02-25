@@ -144,13 +144,9 @@ async function handleQuery(
     return;
   }
 
-  if (domain.in_domain) {
-    retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram' });
-    if (!retrieval.context) {
-      usedWebFallback = true;
-    }
-  } else {
-    // Financial topic but not in docs — web fallback
+  // Always attempt retrieval for any financial query — let vector search decide
+  retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram' });
+  if (!retrieval.context) {
     usedWebFallback = true;
   }
 
@@ -172,7 +168,8 @@ RULES:
 - Each bullet point MUST be immediately followed by a Source line: "  Source: [exact filename from context header], Page [N]"
 - Use the exact filename as it appears in the context headers.
 - Only include facts you can directly cite from the context below.
-- Maximum 5 bullet points.
+- If the answer involves a table (e.g., premium tiers, rate schedules), include ALL rows you can find. If the table appears incomplete, add: "Note: Table may be partial - verify in source document."
+- Maximum 6 bullet points.
 - If no relevant information is found, reply only: "I could not find relevant information for that query in the uploaded documents. Please try rephrasing."
 
 Context from documents:

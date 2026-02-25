@@ -156,9 +156,44 @@ export async function retrieveContextForQuery(params: {
     similarity: chunk.similarity,
   }));
 
+  // Page-expansion: fetch all chunks from pages that had a strong vector match.
+  // This ensures split tables/lists are always retrieved in full.
+  const strongChunks = chunks.filter((c) => c.similarity >= 0.50);
+  if (strongChunks.length > 0) {
+    const docIds = [...new Set(strongChunks.map((c) => c.document_id))];
+    const pageNums = [...new Set(strongChunks.map((c) => c.page_number))];
+
+    const { data: pageData } = await supabase.rpc('get_chunks_by_pages', {
+      doc_ids: docIds,
+      page_nums: pageNums,
+    });
+
+    if (pageData && pageData.length > 0) {
+      const existingKeys = new Set(
+        chunks.map((c) => `${c.document_id}:${c.page_number}:${c.text.slice(0, 40)}`)
+      );
+      for (const pc of pageData as any[]) {
+        const key = `${pc.document_id}:${pc.page_number}:${(pc.text || '').slice(0, 40)}`;
+        if (!existingKeys.has(key)) {
+          chunks.push({
+            document_id: pc.document_id,
+            filename: pc.filename,
+            page_number: pc.page_number,
+            text: pc.text || '',
+            similarity: 0, // page-expanded chunk, not vector-matched
+          });
+          existingKeys.add(key);
+        }
+      }
+      // Keep vector-matched chunks first, then expanded chunks in page order
+      chunks.sort((a, b) => b.similarity - a.similarity || a.page_number - b.page_number);
+    }
+  }
+
   console.log(
     `[RAG][${logLabel}] query="${queryText}" rewritten="${rewrittenQuery}" chunks=${chunks.length} ` +
-    `top=${chunks.map((c) => `${c.filename}:p${c.page_number}@${c.similarity.toFixed(3)}`).join(', ')}`
+    `(${strongChunks.length} vector, ${chunks.length - strongChunks.length} page-expanded) ` +
+    `top=${chunks.slice(0, 5).map((c) => `${c.filename}:p${c.page_number}@${c.similarity.toFixed(3)}`).join(', ')}`
   );
 
   return {
