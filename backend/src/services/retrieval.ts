@@ -30,7 +30,7 @@ export async function rewriteQueryForRetrieval(openai: OpenAI, queryText: string
         {
           role: 'system',
           content:
-            'You are a query preprocessor for a financial advisory document search engine. ' +
+            'You are a query preprocessor for a document search engine. ' +
             "Correct typos, expand abbreviations, and rewrite the user's query as a clear question. " +
             'Return only the rewritten query, without extra commentary.',
         },
@@ -48,12 +48,12 @@ export async function rewriteQueryForRetrieval(openai: OpenAI, queryText: string
 
 function heuristicDomainClassification(query: string): DomainClassification {
   const q = query.toLowerCase();
-  const financePattern =
-    /\b(insurance|annuity|policy|premium|beneficiary|advisor|adviser|portfolio|investment|retirement|superannuation|estate|tax|compliance|wealth|financial|client review|risk profile|fund)\b/;
+  const clearlyOffTopicPattern =
+    /\b(weather|temperature|forecast|sports|score|movie times?|traffic|news|headlines|stock market|bitcoin price|crypto price|exchange rate|breaking news)\b/;
 
-  return financePattern.test(q)
-    ? { in_domain: true, reason: 'Matched finance and insurance keywords.' }
-    : { in_domain: false, reason: 'No finance or insurance terms detected.' };
+  return clearlyOffTopicPattern.test(q)
+    ? { in_domain: false, reason: 'Query appears unrelated to uploaded documents or requests live external data.' }
+    : { in_domain: true, reason: 'Treat as in-domain unless clearly unrelated.' };
 }
 
 export async function classifyQueryDomain(openai: OpenAI, queryText: string): Promise<DomainClassification> {
@@ -64,8 +64,9 @@ export async function classifyQueryDomain(openai: OpenAI, queryText: string): Pr
         {
           role: 'system',
           content:
-            'Classify whether a query belongs to a financial advisory and insurance assistant domain. ' +
-            'Valid in-domain topics include financial planning, insurance, investments, retirement, tax, estate planning, compliance, and client advisory operations. ' +
+            'Classify whether a query should be answered using uploaded documents. ' +
+            'Mark as out-of-domain only when the user is clearly asking for unrelated general knowledge or live external data (for example weather, sports scores, or current market prices). ' +
+            'If the question could plausibly be answered from uploaded documents, mark it in-domain. ' +
             'Return strict JSON only: {"in_domain": boolean, "reason": string}.',
         },
         { role: 'user', content: queryText },

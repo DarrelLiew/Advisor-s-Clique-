@@ -58,7 +58,7 @@ function formatAnswer(answer: string): string {
 }
 
 const OUT_OF_DOMAIN_MESSAGE =
-  'I can only answer questions related to financial advisory and insurance topics in your uploaded documents.';
+  "I can answer questions about your uploaded documents. I can't help with unrelated or live external topics (for example, current stock market updates).";
 
 const MAX_QUERY_LENGTH = 2000;
 
@@ -85,7 +85,7 @@ router.post(
       const startTime = Date.now();
       const queryText = query.trim();
 
-      // 1. Financial-only domain gate
+      // 1. Broad relevance gate (reject only clearly unrelated/live-data queries)
       const domain = await classifyQueryDomain(openai, queryText);
       if (!domain.in_domain) {
         const responseTime = Date.now() - startTime;
@@ -126,11 +126,10 @@ router.post(
 
       // 3. Build prompt and call OpenAI
       const systemPrompt = retrieval.context
-        ? `You are an AI assistant for a financial advisory firm. You answer questions strictly based on the insurance and financial planning documents provided below.
+        ? `You are an AI assistant for uploaded documents. You answer questions strictly based on the documents provided below.
 
 Key instructions:
 - Answer all questions factually using only the document content provided.
-- All terminology must be interpreted as insurance/financial document concepts.
 - Do NOT redirect users to external help lines.
 - Format using markdown. Use bullet points or numbered lists.
 - CRITICAL: After EACH specific fact, claim, or bullet point, immediately add an inline citation showing the page number in square brackets (e.g., [p.5] or [p.3-4]). Use the page numbers from the context headers above.
@@ -139,7 +138,7 @@ Key instructions:
 
 Context from documents:
 ${retrieval.context}`
-        : `You are an AI assistant for a financial advisory firm. No relevant sections were found in the uploaded documents for this query. Let the user know briefly and suggest they rephrase or ask about a topic covered in the firm's documents.`;
+        : `You are an AI assistant for uploaded documents. No relevant sections were found in the uploaded documents for this query. Let the user know briefly and suggest they rephrase or ask about content likely covered in the uploaded documents.`;
 
       if (!retrieval.context) {
         console.log(`[RAG][chat] no_relevant_chunks query="${queryText}" rewritten="${retrieval.rewrittenQuery}"`);

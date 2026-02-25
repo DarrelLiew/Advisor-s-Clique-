@@ -50,7 +50,7 @@ async function sendLongMessage(
 async function handleStart(chatId: number, firstName: string): Promise<void> {
   const welcome =
     `Welcome to Advisors Clique, ${firstName}!\n\n` +
-    `I can answer questions about your firm's financial and insurance documents.\n\n` +
+    `I can answer questions about your uploaded documents.\n\n` +
     `Commands:\n` +
     `/link - Connect your Telegram to your Advisors Clique account\n` +
     `/help - Show this help message\n\n` +
@@ -138,7 +138,7 @@ async function handleQuery(
   });
 
   const systemPrompt = retrieval.context
-    ? `You are an AI assistant for a financial advisory firm. Answer using only the provided documents.
+    ? `You are an AI assistant for uploaded documents. Answer using only the provided documents.
 
 FORMAT YOUR RESPONSE EXACTLY LIKE THIS EXAMPLE:
 Here are the key points:
@@ -159,7 +159,7 @@ RULES:
 
 Context from documents:
 ${retrieval.context}`
-    : `You are an AI assistant for a financial advisory firm. No relevant document sections were found. Reply: "I could not find relevant information for that query in the uploaded documents. Please try rephrasing."`;
+    : `You are an AI assistant for uploaded documents. No relevant document sections were found. Reply: "I could not find relevant information for that query in the uploaded documents. Please try rephrasing."`;
 
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
