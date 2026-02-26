@@ -23,20 +23,36 @@ type DomainClassification = {
   reason: string;
 };
 
-export async function rewriteQueryForRetrieval(openai: OpenAI, queryText: string): Promise<string> {
+export async function rewriteQueryForRetrieval(
+  openai: OpenAI,
+  queryText: string,
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
+): Promise<string> {
   try {
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content:
+          'You are a query preprocessor for a document search engine. ' +
+          "Correct typos, expand abbreviations, and rewrite the user's query as a clear question. " +
+          'If conversation history is provided, use it to resolve pronouns, references, and ambiguous terms. Rewrite the query to be fully self-contained. ' +
+          'Return only the rewritten query, without extra commentary.',
+      },
+    ];
+
+    // Include last 2 exchanges for context resolution
+    if (conversationHistory && conversationHistory.length > 0) {
+      const recent = conversationHistory.slice(-4);
+      for (const msg of recent) {
+        messages.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    messages.push({ role: 'user', content: queryText });
+
     const correction = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You are a query preprocessor for a document search engine. ' +
-            "Correct typos, expand abbreviations, and rewrite the user's query as a clear question. " +
-            'Return only the rewritten query, without extra commentary.',
-        },
-        { role: 'user', content: queryText },
-      ],
+      messages,
       temperature: 0,
       max_tokens: 150,
     });
@@ -52,23 +68,39 @@ function heuristicDomainClassification(_query: string): DomainClassification {
   return { in_domain: true, is_financial: true, reason: 'Defaulting to in-domain — LLM classification unavailable.' };
 }
 
-export async function classifyQueryDomain(openai: OpenAI, queryText: string): Promise<DomainClassification> {
+export async function classifyQueryDomain(
+  openai: OpenAI,
+  queryText: string,
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
+): Promise<DomainClassification> {
   try {
+    const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+      {
+        role: 'system',
+        content:
+          'You are a query classifier for a financial advisory assistant. Classify each query into one of three tiers:\n' +
+          '1. in_domain=true, is_financial=true: Query is related to topics likely covered in uploaded advisory documents (compliance, products, client processes, regulations, internal procedures).\n' +
+          '2. in_domain=false, is_financial=true: Query is a general finance/business question (e.g. "What is a GIC?", "How do bonds work?", "What is MER?") — relevant to advisory work but unlikely to be in uploaded docs.\n' +
+          '3. in_domain=false, is_financial=false: Query has NO connection to finance, business, or professional advisory work (e.g. sports scores, cooking, weather, entertainment). These should be rejected.\n' +
+          'When in doubt between tier 1 and 2, choose tier 1. Only use tier 3 for clearly non-professional, non-financial topics.\n' +
+          'If conversation history is provided, use it to understand the context of the query. A short or ambiguous query that follows a financial/advisory conversation should be classified as tier 1 or tier 2, not tier 3.\n' +
+          'Return strict JSON only: {"in_domain": boolean, "is_financial": boolean, "reason": string}.',
+      },
+    ];
+
+    // Include last 2 exchanges so the classifier can resolve ambiguous follow-ups
+    if (conversationHistory && conversationHistory.length > 0) {
+      const recent = conversationHistory.slice(-4);
+      for (const msg of recent) {
+        messages.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    messages.push({ role: 'user', content: queryText });
+
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You are a query classifier for a financial advisory assistant. Classify each query into one of three tiers:\n' +
-            '1. in_domain=true, is_financial=true: Query is related to topics likely covered in uploaded advisory documents (compliance, products, client processes, regulations, internal procedures).\n' +
-            '2. in_domain=false, is_financial=true: Query is a general finance/business question (e.g. "What is a GIC?", "How do bonds work?", "What is MER?") — relevant to advisory work but unlikely to be in uploaded docs.\n' +
-            '3. in_domain=false, is_financial=false: Query has NO connection to finance, business, or professional advisory work (e.g. sports scores, cooking, weather, entertainment). These should be rejected.\n' +
-            'When in doubt between tier 1 and 2, choose tier 1. Only use tier 3 for clearly non-professional, non-financial topics.\n' +
-            'Return strict JSON only: {"in_domain": boolean, "is_financial": boolean, "reason": string}.',
-        },
-        { role: 'user', content: queryText },
-      ],
+      messages,
       temperature: 0,
       max_tokens: 150,
     });
@@ -129,9 +161,10 @@ export async function retrieveContextForQuery(params: {
   openai: OpenAI;
   queryText: string;
   logLabel: string;
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
 }) {
-  const { openai, queryText, logLabel } = params;
-  const rewrittenQuery = await rewriteQueryForRetrieval(openai, queryText);
+  const { openai, queryText, logLabel, conversationHistory } = params;
+  const rewrittenQuery = await rewriteQueryForRetrieval(openai, queryText, conversationHistory);
 
   const embeddingResponse = await openai.embeddings.create({
     model: 'text-embedding-3-small',
@@ -152,7 +185,7 @@ export async function retrieveContextForQuery(params: {
     document_id: chunk.document_id,
     filename: chunk.filename,
     page_number: chunk.page_number,
-    text: chunk.text || chunk.content || '',
+    text: chunk.text || '',
     similarity: chunk.similarity,
   }));
 

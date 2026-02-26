@@ -22,11 +22,38 @@ interface Stats {
     ready: number;
     failed: number;
   };
-  recent_questions: Array<{ query_text: string; created_at: string }>;
+  recent_questions: Array<{ query_text: string; timestamp: string }>;
+}
+
+interface UnansweredSeriesPoint {
+  month: string;
+  count: number;
+}
+
+interface TopQueryCategory {
+  category: string;
+  count: number;
+}
+
+function formatMonthLabel(monthKey: string): string {
+  const [yearStr, monthStr] = monthKey.split("-");
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+    return monthKey;
+  }
+
+  return new Date(Date.UTC(year, month - 1, 1)).toLocaleDateString(undefined, {
+    month: "short",
+    year: "numeric",
+  });
 }
 
 export default function AdminDashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
+  const [unansweredSeries, setUnansweredSeries] = useState<UnansweredSeriesPoint[]>([]);
+  const [topCategories, setTopCategories] = useState<TopQueryCategory[]>([]);
   const [loading, setLoading] = useState(true);
   const supabase = createClient();
   const router = useRouter();
@@ -37,8 +64,15 @@ export default function AdminDashboard() {
 
   const loadStats = async () => {
     try {
-      const data = await api.get<Stats>("/api/admin/dashboard/stats");
-      setStats(data);
+      const [statsData, unansweredData, topQueryData] = await Promise.all([
+        api.get<Stats>("/api/admin/dashboard/stats"),
+        api.get<{ data: UnansweredSeriesPoint[] }>("/api/admin/analytics/unanswered?months=3"),
+        api.get<{ data: TopQueryCategory[] }>("/api/admin/analytics/top-queries?limit=10"),
+      ]);
+
+      setStats(statsData);
+      setUnansweredSeries(unansweredData.data ?? []);
+      setTopCategories(topQueryData.data ?? []);
     } catch (error) {
       if (error instanceof SessionExpiredError) {
         router.push("/login");
@@ -54,6 +88,8 @@ export default function AdminDashboard() {
     await supabase.auth.signOut();
     router.push("/login");
   };
+
+  const totalTopCategoryCount = topCategories.reduce((sum, item) => sum + item.count, 0);
 
   return (
     <div className='min-h-screen bg-gray-50'>
@@ -129,7 +165,7 @@ export default function AdminDashboard() {
                     <div key={idx} className='border-b pb-3 last:border-0'>
                       <p className='text-sm'>{q.query_text}</p>
                       <p className='text-xs text-gray-500 mt-1'>
-                        {new Date(q.created_at).toLocaleString()}
+                        {new Date(q.timestamp).toLocaleString()}
                       </p>
                     </div>
                   ))}
@@ -137,6 +173,54 @@ export default function AdminDashboard() {
               ) : (
                 <p className='text-gray-500 text-sm'>No questions yet</p>
               )}
+            </div>
+
+            <div className='grid grid-cols-1 lg:grid-cols-2 gap-6'>
+              <div className='bg-white rounded-lg shadow-sm border p-6'>
+                <h2 className='text-lg font-semibold mb-4'>Unanswered Questions (Last 3 Months)</h2>
+                {unansweredSeries.length > 0 ? (
+                  <div className='space-y-3'>
+                    {unansweredSeries.map((point) => (
+                      <div key={point.month} className='flex items-center justify-between border-b pb-2 last:border-0'>
+                        <span className='text-sm text-gray-700'>{formatMonthLabel(point.month)}</span>
+                        <span className='text-sm font-semibold'>{point.count}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className='text-sm text-gray-500'>No unanswered questions in this period.</p>
+                )}
+              </div>
+
+              <div className='bg-white rounded-lg shadow-sm border p-6'>
+                <h2 className='text-lg font-semibold mb-4'>Top Query Categories (30 Days)</h2>
+                {topCategories.length > 0 ? (
+                  <div className='space-y-4'>
+                    {topCategories.map((item) => {
+                      const percentage = totalTopCategoryCount > 0
+                        ? Math.round((item.count / totalTopCategoryCount) * 100)
+                        : 0;
+
+                      return (
+                        <div key={item.category}>
+                          <div className='flex items-center justify-between text-sm mb-1'>
+                            <span className='font-medium'>{item.category}</span>
+                            <span className='text-gray-600'>{item.count} ({percentage}%)</span>
+                          </div>
+                          <div className='w-full h-2 rounded bg-gray-100 overflow-hidden'>
+                            <div
+                              className='h-full bg-primary'
+                              style={{ width: `${percentage}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className='text-sm text-gray-500'>No recent query categories to display.</p>
+                )}
+              </div>
             </div>
 
             {/* Quick Actions */}

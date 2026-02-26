@@ -7,6 +7,53 @@ import { uploadLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 
 const router = Router();
 
+const UNANSWERED_OUTCOMES = new Set(['domain_gate_reject', 'web_fallback', 'no_chunks']);
+
+const QUERY_CATEGORIES: Array<{ category: string; keywords: string[] }> = [
+  { category: 'Compliance', keywords: ['compliance', 'regulation', 'regulatory', 'kyc', 'aml', 'know your client', 'ciro', 'iiroc'] },
+  { category: 'Products', keywords: ['gic', 'mutual fund', 'etf', 'annuity', 'bond', 'stock', 'equity', 'fixed income'] },
+  { category: 'Client Suitability', keywords: ['suitability', 'risk tolerance', 'risk profile', 'time horizon', 'client profile'] },
+  { category: 'Fees', keywords: ['fee', 'fees', 'commission', 'trailer', 'expense ratio', 'mer'] },
+  { category: 'Tax', keywords: ['tax', 'capital gains', 'rrsp', 'tfsa', 'taxable'] },
+  { category: 'Retirement', keywords: ['retirement', 'pension', 'drawdown', 'income planning'] },
+  { category: 'Insurance', keywords: ['insurance', 'life insurance', 'disability', 'critical illness'] },
+  { category: 'Estate Planning', keywords: ['estate', 'will', 'trust', 'beneficiary', 'power of attorney'] },
+];
+
+function getSingleQueryParam(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && value.length > 0 && typeof value[0] === 'string') {
+    return value[0];
+  }
+  return null;
+}
+
+function categorizeQueryText(queryText: string): string {
+  const normalized = queryText.toLowerCase();
+  for (const bucket of QUERY_CATEGORIES) {
+    if (bucket.keywords.some((keyword) => normalized.includes(keyword))) {
+      return bucket.category;
+    }
+  }
+  return 'General';
+}
+
+function getMonthKey(date: Date): string {
+  return date.toISOString().slice(0, 7);
+}
+
+function buildRecentMonthKeys(months: number): string[] {
+  const now = new Date();
+  const monthKeys: string[] = [];
+
+  for (let offset = months - 1; offset >= 0; offset--) {
+    const monthDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - offset, 1));
+    monthKeys.push(getMonthKey(monthDate));
+  }
+
+  return monthKeys;
+}
+
 // Apply auth middleware to all admin routes
 router.use(authenticateUser);
 router.use(requireAdmin);
@@ -377,13 +424,13 @@ router.get('/dashboard/stats', async (req: AuthenticatedRequest, res) => {
     const { count: questionsLast30Days } = await supabase
       .from('question_analytics')
       .select('*', { count: 'exact', head: true })
-      .gte('created_at', thirtyDaysAgo.toISOString());
+      .gte('timestamp', thirtyDaysAgo.toISOString());
 
     // Get recent questions (last 10)
     const { data: recentQuestions } = await supabase
       .from('question_analytics')
-      .select('query_text, created_at')
-      .order('created_at', { ascending: false })
+      .select('query_text, timestamp')
+      .order('timestamp', { ascending: false })
       .limit(10);
 
     res.json({
@@ -404,16 +451,16 @@ router.get('/analytics/monthly', async (_req: AuthenticatedRequest, res) => {
   try {
     const { data, error } = await supabase
       .from('question_analytics')
-      .select('created_at, query_text')
-      .gte('created_at', new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString())
-      .order('created_at', { ascending: true });
+      .select('timestamp, query_text')
+      .gte('timestamp', new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString())
+      .order('timestamp', { ascending: true });
 
     if (error) throw error;
 
     // Group by month
     const monthlyData: Record<string, number> = {};
     data?.forEach(item => {
-      const month = item.created_at.substring(0, 7); // YYYY-MM
+      const month = item.timestamp.substring(0, 7); // YYYY-MM
       monthlyData[month] = (monthlyData[month] || 0) + 1;
     });
 
@@ -426,6 +473,97 @@ router.get('/analytics/monthly', async (_req: AuthenticatedRequest, res) => {
   } catch (error: any) {
     console.error('Monthly analytics error:', error);
     res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// Unanswered / fallback analytics by month
+router.get('/analytics/unanswered', async (req: AuthenticatedRequest, res) => {
+  try {
+    const monthsParam = getSingleQueryParam(req.query.months);
+    const parsedMonths = monthsParam ? Number.parseInt(monthsParam, 10) : NaN;
+    const months = Number.isInteger(parsedMonths) && parsedMonths > 0 ? Math.min(parsedMonths, 24) : 3;
+    const monthKeys = buildRecentMonthKeys(months);
+
+    const startDate = new Date(Date.UTC(
+      new Date().getUTCFullYear(),
+      new Date().getUTCMonth() - (months - 1),
+      1,
+    ));
+
+    const { data, error } = await supabase
+      .from('question_analytics')
+      .select('timestamp, metadata')
+      .gte('timestamp', startDate.toISOString())
+      .order('timestamp', { ascending: true });
+
+    if (error) {
+      const message = (error.message || '').toLowerCase();
+      if (message.includes('metadata') && (message.includes('column') || message.includes('does not exist'))) {
+        return res.json({ data: monthKeys.map((month) => ({ month, count: 0 })) });
+      }
+      throw error;
+    }
+
+    const counts = monthKeys.reduce<Record<string, number>>((acc, month) => {
+      acc[month] = 0;
+      return acc;
+    }, {});
+
+    for (const row of (data ?? []) as Array<{ timestamp: string; metadata: Record<string, unknown> | null }>) {
+      const month = row.timestamp?.slice(0, 7);
+      if (!month || !(month in counts)) continue;
+
+      const outcome = row.metadata?.outcome;
+      if (typeof outcome === 'string' && UNANSWERED_OUTCOMES.has(outcome)) {
+        counts[month] += 1;
+      }
+    }
+
+    res.json({
+      data: monthKeys.map((month) => ({
+        month,
+        count: counts[month] ?? 0,
+      })),
+    });
+  } catch (error: any) {
+    console.error('Unanswered analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch unanswered analytics' });
+  }
+});
+
+// Top query categories (last 30 days)
+router.get('/analytics/top-queries', async (req: AuthenticatedRequest, res) => {
+  try {
+    const limitParam = getSingleQueryParam(req.query.limit);
+    const parsedLimit = limitParam ? Number.parseInt(limitParam, 10) : NaN;
+    const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 25) : 10;
+
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    const { data, error } = await supabase
+      .from('question_analytics')
+      .select('query_text')
+      .gte('timestamp', thirtyDaysAgo)
+      .order('timestamp', { ascending: false })
+      .limit(1000);
+
+    if (error) throw error;
+
+    const categoryCounts: Record<string, number> = {};
+    for (const row of (data ?? []) as Array<{ query_text: string }>) {
+      const category = categorizeQueryText(row.query_text || '');
+      categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+    }
+
+    const ranked = Object.entries(categoryCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([category, count]) => ({ category, count }));
+
+    res.json({ data: ranked });
+  } catch (error: any) {
+    console.error('Top query categories error:', error);
+    res.status(500).json({ error: 'Failed to fetch top query categories' });
   }
 });
 

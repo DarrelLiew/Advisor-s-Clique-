@@ -74,12 +74,13 @@ CREATE TABLE IF NOT EXISTS public.documents (
   file_path TEXT NOT NULL,
   mime_type TEXT DEFAULT 'application/pdf',
   uploaded_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
-  processing_status TEXT NOT NULL DEFAULT 'pending' 
+  processing_status TEXT NOT NULL DEFAULT 'pending'
     CHECK (processing_status IN ('pending', 'processing', 'ready', 'failed')),
   total_chunks INTEGER,
   total_pages INTEGER,
   processed_at TIMESTAMPTZ,
   uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ,  -- soft-delete; search_documents filters WHERE deleted_at IS NULL
   error_message TEXT,
   metadata JSONB DEFAULT '{}'::jsonb
 );
@@ -139,8 +140,9 @@ CREATE TABLE IF NOT EXISTS public.document_chunks (
   document_id UUID NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
   page_number INTEGER NOT NULL,
   chunk_index INTEGER NOT NULL,
-  text TEXT NOT NULL,
+  content TEXT NOT NULL,  -- NOTE: column is 'content', not 'text'. SQL functions alias it as 'text' in their return types.
   embedding vector(1536),  -- OpenAI text-embedding-3-small dimension
+  metadata JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -165,12 +167,33 @@ CREATE POLICY "Service role can insert chunks"
   WITH CHECK (true);
 
 -- ============================================================================
+-- CHAT SESSIONS TABLE
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS public.chat_sessions (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  name TEXT NOT NULL DEFAULT 'New Chat',
+  mode TEXT NOT NULL DEFAULT 'client' CHECK (mode IN ('client', 'learner')),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON public.chat_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated_at ON public.chat_sessions(updated_at DESC);
+
+ALTER TABLE public.chat_sessions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Users manage own sessions" ON public.chat_sessions
+  FOR ALL USING (auth.uid() = user_id);
+
+-- ============================================================================
 -- CHAT MESSAGES TABLE
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS public.chat_messages (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  session_id UUID REFERENCES public.chat_sessions(id) ON DELETE CASCADE,
   query TEXT NOT NULL,
   response TEXT NOT NULL,
   sources JSONB DEFAULT '[]'::jsonb,
@@ -181,6 +204,7 @@ CREATE TABLE IF NOT EXISTS public.chat_messages (
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_chat_user_id ON public.chat_messages(user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_created_at ON public.chat_messages(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON public.chat_messages(session_id, created_at DESC);
 
 -- RLS Policies
 ALTER TABLE public.chat_messages ENABLE ROW LEVEL SECURITY;
@@ -212,18 +236,22 @@ CREATE POLICY "Admins can view all messages"
 -- QUESTION ANALYTICS TABLE
 -- ============================================================================
 
+-- NOTE: live table uses 'timestamp' not 'created_at'. All queries must use .order('timestamp') / .gte('timestamp').
+-- There is NO 'metadata' column — outcome/chunks data is not currently persisted (analyticsLog.ts drops it silently).
 CREATE TABLE IF NOT EXISTS public.question_analytics (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
   query_text TEXT NOT NULL,
+  query_embedding vector(1536),
   response_time_ms INTEGER,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  metadata JSONB DEFAULT '{}'::jsonb
+  timestamp TIMESTAMPTZ DEFAULT NOW(),
+  cluster_id UUID,
+  session_id TEXT
 );
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_analytics_user_id ON public.question_analytics(user_id);
-CREATE INDEX IF NOT EXISTS idx_analytics_created_at ON public.question_analytics(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON public.question_analytics(timestamp DESC);
 
 -- RLS Policies
 ALTER TABLE public.question_analytics ENABLE ROW LEVEL SECURITY;
@@ -325,43 +353,52 @@ RETURNS void
 LANGUAGE sql
 SECURITY DEFINER
 AS $$
-  INSERT INTO public.document_chunks (document_id, page_number, chunk_index, text, embedding)
+  INSERT INTO public.document_chunks (document_id, page_number, chunk_index, content, embedding)
   SELECT
     (chunk->>'document_id')::uuid,
     (chunk->>'page_number')::integer,
     (chunk->>'chunk_index')::integer,
-    chunk->>'text',
+    chunk->>'content',
     (chunk->>'embedding')::vector
   FROM jsonb_array_elements($1) AS chunk;
 $$;
 
 -- Vector similarity search function
+-- NOTE: 'content' column is returned as 'text' in the result set — that is the alias used in TypeScript.
 CREATE OR REPLACE FUNCTION search_documents(
   query_embedding vector(1536),
   match_threshold float DEFAULT 0.7,
-  match_count int DEFAULT 5
+  match_count int DEFAULT 5,
+  filter_document_ids uuid[] DEFAULT NULL
 )
 RETURNS TABLE (
+  id uuid,
   document_id uuid,
   filename text,
+  text text,       -- aliased from document_chunks.content
   page_number int,
-  text text,
-  similarity float
+  similarity float,
+  metadata jsonb
 )
 LANGUAGE plpgsql
 AS $$
 BEGIN
   RETURN QUERY
   SELECT
+    dc.id,
     dc.document_id,
     d.filename,
+    dc.content,    -- stored as 'content', returned as 'text'
     dc.page_number,
-    dc.text AS text,
-    1 - (dc.embedding <=> query_embedding) AS similarity
+    1 - (dc.embedding <=> query_embedding) AS similarity,
+    dc.metadata
   FROM document_chunks dc
-  JOIN documents d ON dc.document_id = d.id
-  WHERE 1 - (dc.embedding <=> query_embedding) > match_threshold
+  JOIN documents d ON d.id = dc.document_id
+  WHERE
+    d.deleted_at IS NULL
     AND d.processing_status = 'ready'
+    AND (filter_document_ids IS NULL OR dc.document_id = ANY(filter_document_ids))
+    AND 1 - (dc.embedding <=> query_embedding) > match_threshold
   ORDER BY dc.embedding <=> query_embedding
   LIMIT match_count;
 END;

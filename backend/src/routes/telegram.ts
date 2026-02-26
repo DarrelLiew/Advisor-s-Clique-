@@ -8,6 +8,7 @@ import { classifyQueryDomain, retrieveContextForQuery } from '../services/retrie
 import { telegramLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
+import { buildSystemPrompt, formatForTelegram } from '../services/promptBuilder';
 
 const router = Router();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -45,6 +46,25 @@ async function sendLongMessage(
 
   await sendMessage(chatId, text.slice(0, cutAt));
   await sendLongMessage(chatId, text.slice(cutAt).trimStart(), replyMarkup);
+}
+
+// Extract page numbers from inline citations [p.X] in the answer
+function extractCitedPages(answer: string): number[] {
+  const pageMatches = answer.match(/\[p\.(\d+)(?:-(\d+))?\]/g) || [];
+  const pages = new Set<number>();
+
+  pageMatches.forEach((match) => {
+    const pageRange = match.match(/\d+/g);
+    if (pageRange) {
+      const start = parseInt(pageRange[0], 10);
+      const end = pageRange[1] ? parseInt(pageRange[1], 10) : start;
+      for (let i = start; i <= end; i++) {
+        pages.add(i);
+      }
+    }
+  });
+
+  return Array.from(pages).sort((a, b) => a - b);
 }
 
 async function handleStart(chatId: number, firstName: string): Promise<void> {
@@ -132,90 +152,87 @@ async function handleQuery(
   const userId = profile.id;
   const startTime = Date.now();
 
+  // Fetch last 2 messages for lightweight conversation context (2 exchanges)
+  const { data: historyRows } = await supabase
+    .from('chat_messages')
+    .select('query, response')
+    .eq('user_id', userId)
+    .is('session_id', null) // Telegram messages have no session_id
+    .order('created_at', { ascending: false })
+    .limit(2);
+
+  const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  if (historyRows && historyRows.length > 0) {
+    for (const row of [...historyRows].reverse()) {
+      conversationHistory.push({ role: 'user', content: row.query });
+      conversationHistory.push({ role: 'assistant', content: row.response });
+    }
+  }
+
   // 1. Classify domain — three-tier: in-docs / financial-general / off-topic
-  const domain = await classifyQueryDomain(openai, queryText);
+  const domain = await classifyQueryDomain(openai, queryText, conversationHistory);
   let usedWebFallback = false;
   let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
 
   if (!domain.in_domain && !domain.is_financial) {
     // Completely off-topic — reject
     await sendMessage(chatId, "I'm here to help with financial advisory topics. That question falls outside the scope of this assistant.");
-    logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'rejected', reason: domain.reason } });
+    logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'domain_gate_reject', reason: domain.reason } });
     return;
   }
 
   // Always attempt retrieval for any financial query — let vector search decide
-  retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram' });
+  retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram', conversationHistory });
   if (!retrieval.context) {
     usedWebFallback = true;
   }
 
-  // 2. Build system prompt
-  const systemPrompt = !usedWebFallback && retrieval?.context
-    ? `You are an AI assistant for uploaded documents. Answer using only the provided documents.
-
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS EXAMPLE:
-Here are the key points:
-
-* Annual reviews must be conducted for all clients
-  Source: Compliance Manual.pdf, Page 5
-
-* Product summaries must be provided to clients before any sale
-  Source: Client Guide.pdf, Page 3
-
-RULES:
-- Plain text only. No markdown. No asterisks for bold. Use * for bullet points only.
-- Each bullet point MUST be immediately followed by a Source line: "  Source: [exact filename from context header], Page [N]"
-- Use the exact filename as it appears in the context headers.
-- Only include facts you can directly cite from the context below.
-- If the answer involves a table (e.g., premium tiers, rate schedules), include ALL rows you can find. If the table appears incomplete, add: "Note: Table may be partial - verify in source document."
-- Maximum 6 bullet points.
-- If no relevant information is found, reply only: "I could not find relevant information for that query in the uploaded documents. Please try rephrasing."
-
-Context from documents:
-${retrieval!.context}`
-    : `You are a knowledgeable financial advisory assistant. Answer from your general knowledge.
-Start your response with "[Web]" to indicate this answer is not from uploaded documents.
-Plain text only. No markdown. Be concise and accurate.`;
+  // 2. Build system prompt using unified builder (same as web app, only formatting differs)
+  // Telegram always uses client mode (concise) and plaintext format
+  const systemPrompt = buildSystemPrompt(
+    retrieval?.context || '',
+    'client', // Telegram always uses client mode (concise)
+    'plaintext', // Telegram uses plaintext format
+    usedWebFallback,
+  );
 
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: systemPrompt },
+      ...conversationHistory,
       { role: 'user', content: queryText },
     ],
-    temperature: 0.3,
+    temperature: 0,
     max_tokens: 1000,
   });
 
-  const answer = completion.choices[0].message.content ?? 'No response generated.';
+  let answer = completion.choices[0].message.content ?? 'No response generated.';
   const responseTime = Date.now() - startTime;
 
-  // 3. Build inline keyboard buttons (only for document-sourced answers)
+  // 3. Format answer for Telegram (strip markdown, convert plaintext)
+  answer = formatForTelegram(answer);
+
+  // 4. Build inline keyboard buttons (only for document-sourced answers)
   let replyMarkup: object | undefined;
 
   if (!usedWebFallback && retrieval) {
+    const citedPages = extractCitedPages(answer);
     const citedSources: Array<{ filename: string; page: number; document_id: string }> = [];
-    const sourceLineRegex = /Source:\s*(.+?),\s*Page\s*(\d+)/gi;
-    let match: RegExpExecArray | null;
 
-    while ((match = sourceLineRegex.exec(answer)) !== null) {
-      const citedFilename = match[1].trim();
-      const citedPage = parseInt(match[2], 10);
-
-      const matchedChunk = retrieval.chunks.find(
-        (c) => c.filename.toLowerCase() === citedFilename.toLowerCase() && c.page_number === citedPage
-      );
-      const alreadyAdded = citedSources.some(
-        (c) => c.filename === citedFilename && c.page === citedPage
-      );
-
-      if (matchedChunk && !alreadyAdded) {
-        citedSources.push({
-          filename: matchedChunk.filename,
-          page: matchedChunk.page_number,
-          document_id: matchedChunk.document_id,
-        });
+    // Build a set of unique sources from retrieved chunks that match cited pages
+    const seen = new Set<string>();
+    for (const chunk of retrieval.chunks) {
+      if (citedPages.includes(chunk.page_number)) {
+        const key = `${chunk.filename}:${chunk.page_number}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          citedSources.push({
+            filename: chunk.filename,
+            page: chunk.page_number,
+            document_id: chunk.document_id,
+          });
+        }
       }
     }
 
@@ -257,7 +274,7 @@ Plain text only. No markdown. Be concise and accurate.`;
     queryText,
     responseTimeMs: responseTime,
     metadata: {
-      outcome: usedWebFallback ? 'web_fallback' : 'success',
+      outcome: usedWebFallback ? (domain.in_domain ? 'no_chunks' : 'web_fallback') : 'success',
       rewritten_query: retrieval?.rewrittenQuery ?? null,
       chunks_retrieved: retrieval?.chunks.length ?? 0,
       source_count: retrieval?.sources.length ?? 0,

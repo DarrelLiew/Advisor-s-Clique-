@@ -36,11 +36,18 @@ Return an extended type: `{ in_domain: boolean, is_financial: boolean, reason: s
 - `in_domain: false, is_financial: true` → financial/business topic, no retrieval, answer with `[Web]`
 - `in_domain: false, is_financial: false` → completely off-topic, reject with scope message
 
+### Conversation-Aware Classification & Retrieval
+
+Both `classifyQueryDomain()` and `rewriteQueryForRetrieval()` accept optional `conversationHistory` (last 2 exchanges). This prevents ambiguous follow-up queries (e.g., "what is choice 5, 10, 15?") from being incorrectly rejected. The query rewriter also uses history to produce self-contained search queries from vague follow-ups.
+
+- **Web chat:** passes session conversation history to classifier + retrieval
+- **Telegram:** fetches last 2 messages (no session_id) for lightweight memory, passes to classifier + retrieval + LLM call
+
 ### Files Modified
 
-- `backend/src/services/retrieval.ts` — updated `classifyQueryDomain()` + heuristic
-- `backend/src/routes/chat.ts` — three-tier handling, `[Web]` only for financial fallback
-- `backend/src/routes/telegram.ts` — same three-tier logic
+- `backend/src/services/retrieval.ts` — `classifyQueryDomain()`, `rewriteQueryForRetrieval()`, and `retrieveContextForQuery()` accept optional `conversationHistory`
+- `backend/src/routes/chat.ts` — three-tier handling, passes conversationHistory to classifier + retrieval
+- `backend/src/routes/telegram.ts` — same three-tier logic, fetches lightweight conversation history (last 2 rows from chat_messages where session_id IS NULL)
 
 ### Analytics Outcomes
 
@@ -147,7 +154,7 @@ export function buildSystemPrompt(
 
 **Client mode prompt additions:**
 
-- _"Be concise. Give bullet points with brief, one-line descriptions. Do not elaborate unless asked. Prioritize clarity and speed of reading."_
+- _"Present ALL relevant information from the documents as bullet points. Keep each point to 1-2 sentences. Do not skip or omit information — include every relevant fact, but state it briefly."_
 
 **Learner mode prompt additions:**
 
@@ -255,6 +262,7 @@ Add two new sections below existing stats:
 
 - Ask several questions that don't match documents → check admin dashboard shows them in unanswered count
 - Ask financial questions → check top query categories populate
+
 - Verify monthly breakdown is accurate
 
 ---

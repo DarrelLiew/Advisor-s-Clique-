@@ -6,6 +6,7 @@ import { supabase } from '../lib/supabase';
 import { chatLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
+import { buildSystemPrompt } from '../services/promptBuilder';
 
 const router = Router();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -31,7 +32,7 @@ function extractCitedPages(answer: string): number[] {
 
 // Filter sources to only include cited pages
 function filterSourcesByCitations(sources: any[], citedPages: number[]): any[] {
-  if (citedPages.length === 0) return sources;
+  if (citedPages.length === 0) return [];
   return sources.filter((source) => citedPages.includes(source.page));
 }
 
@@ -59,14 +60,112 @@ function formatAnswer(answer: string): string {
 
 const MAX_QUERY_LENGTH = 2000;
 
-// Send chat message
+// ============================================================================
+// Session CRUD
+// ============================================================================
+
+// Create session
+router.post('/sessions', authenticateUser, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const { name = 'New Chat', mode = 'client' } = req.body;
+
+    if (!['client', 'learner'].includes(mode)) {
+      return res.status(400).json({ error: 'mode must be "client" or "learner"' });
+    }
+
+    const { data, error } = await supabase
+      .from('chat_sessions')
+      .insert({ user_id: userId, name: name.trim() || 'New Chat', mode })
+      .select('id, name, mode, created_at, updated_at')
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error: any) {
+    console.error('Create session error:', error);
+    res.status(500).json({ error: 'Failed to create session' });
+  }
+});
+
+// List sessions
+router.get('/sessions', authenticateUser, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.id;
+
+    const { data, error } = await supabase
+      .from('chat_sessions')
+      .select('id, name, mode, created_at, updated_at')
+      .eq('user_id', userId)
+      .order('updated_at', { ascending: false });
+
+    if (error) throw error;
+    res.json({ sessions: data });
+  } catch (error: any) {
+    console.error('List sessions error:', error);
+    res.status(500).json({ error: 'Failed to fetch sessions' });
+  }
+});
+
+// Delete session
+router.delete('/sessions/:id', authenticateUser, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from('chat_sessions')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (error: any) {
+    console.error('Delete session error:', error);
+    res.status(500).json({ error: 'Failed to delete session' });
+  }
+});
+
+// Rename session
+router.patch('/sessions/:id', authenticateUser, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const { id } = req.params;
+    const { name } = req.body;
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('chat_sessions')
+      .update({ name: name.trim() })
+      .eq('id', id)
+      .eq('user_id', userId)
+      .select('id, name, mode, created_at, updated_at')
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Session not found' });
+    res.json(data);
+  } catch (error: any) {
+    console.error('Rename session error:', error);
+    res.status(500).json({ error: 'Failed to rename session' });
+  }
+});
+
+// ============================================================================
+// Chat message
+// ============================================================================
+
 router.post(
   '/message',
   authenticateUser,
   rateLimitMiddleware(chatLimiter, (req: any) => req.user?.id || req.ip || 'unknown'),
   async (req: AuthenticatedRequest, res) => {
     try {
-      const { query } = req.body;
+      const { query, session_id } = req.body;
       const userId = req.user!.id;
 
       if (!query || typeof query !== 'string' || query.trim().length === 0) {
@@ -79,11 +178,44 @@ router.post(
         });
       }
 
+      if (!session_id) {
+        return res.status(400).json({ error: 'session_id is required' });
+      }
+
+      // Verify the session belongs to this user
+      const { data: session, error: sessionError } = await supabase
+        .from('chat_sessions')
+        .select('id, mode')
+        .eq('id', session_id)
+        .eq('user_id', userId)
+        .single();
+
+      if (sessionError || !session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Fetch last 6 messages from this session for conversation history (3 exchanges)
+      const { data: historyRows } = await supabase
+        .from('chat_messages')
+        .select('query, response')
+        .eq('session_id', session_id)
+        .order('created_at', { ascending: false })
+        .limit(6);
+
+      // Reverse to chronological order for the prompt
+      const conversationHistory: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      if (historyRows && historyRows.length > 0) {
+        for (const row of [...historyRows].reverse()) {
+          conversationHistory.push({ role: 'user', content: row.query });
+          conversationHistory.push({ role: 'assistant', content: row.response });
+        }
+      }
+
       const startTime = Date.now();
       const queryText = query.trim();
 
       // 1. Classify domain — three-tier: in-docs / financial-general / off-topic
-      const domain = await classifyQueryDomain(openai, queryText);
+      const domain = await classifyQueryDomain(openai, queryText, conversationHistory);
       let usedWebFallback = false;
       let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
 
@@ -93,46 +225,47 @@ router.post(
         const rejectionMsg = "I'm here to help with financial advisory topics. That question falls outside the scope of this assistant.";
         console.log(`[RAG][chat] rejected query="${queryText}" reason="${domain.reason}"`);
 
-        await supabase.from('chat_messages').insert({ user_id: userId, query, response: rejectionMsg, sources: [] });
-        logQueryAnalytics({ userId, queryText: query, responseTimeMs: responseTime, metadata: { outcome: 'rejected', reason: domain.reason } });
+        await supabase.from('chat_messages').insert({ user_id: userId, session_id, query, response: rejectionMsg, sources: [] });
+        logQueryAnalytics({
+          userId,
+          queryText: query,
+          responseTimeMs: responseTime,
+          metadata: { outcome: 'domain_gate_reject', reason: domain.reason },
+        });
 
         return res.json({ answer: rejectionMsg, sources: [], response_time_ms: responseTime, chat_saved: true });
       }
 
       // 2b. Always attempt retrieval for any financial query — let vector search decide
-      // (classifier can't know if a specific product/term is in uploaded docs)
-      retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat' });
-      if (!retrieval.context) {
+      retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat', conversationHistory });
+      const noChunks = !retrieval.context;
+      if (noChunks) {
         usedWebFallback = true;
         console.log(`[RAG][chat] no_chunks_found query="${queryText}" in_domain=${domain.in_domain} reason="${domain.reason}"`);
+      } else {
+        console.log(`[RAG][chat] context_length=${retrieval.context.length} sources=${retrieval.sources.length} usedWebFallback=${usedWebFallback}`);
+        console.log(`[RAG][chat] context_preview="${retrieval.context.substring(0, 500)}..."`);
       }
 
-      // 3. Build system prompt
-      const systemPrompt = !usedWebFallback && retrieval?.context
-        ? `You are an AI assistant for uploaded documents. You answer questions strictly based on the documents provided below.
+      // 3. Build system prompt using unified builder (same for web and Telegram)
+      const systemPrompt = buildSystemPrompt(
+        retrieval?.context || '',
+        session.mode as 'client' | 'learner',
+        'markdown', // Web app uses markdown format
+        usedWebFallback,
+      );
 
-Key instructions:
-- Answer all questions factually using only the document content provided.
-- Do NOT redirect users to external help lines.
-- Format using markdown. Use bullet points or numbered lists.
-- CRITICAL: After EACH specific fact, claim, or bullet point, immediately add an inline citation showing the page number in square brackets (e.g., [p.5] or [p.3-4]). Use the page numbers from the context headers above.
-- Do NOT list sources at the end - citations must be inline next to each point.
-- If the answer involves a table (e.g., premium tiers, rate schedules, benefit schedules), include ALL rows you can find in the context. If the table appears incomplete or cut off, add: "Note: This table may be partial — please verify in the source document."
-- If the documents do not contain the answer, say so directly and briefly.
-
-Context from documents:
-${retrieval!.context}`
-        : `You are a knowledgeable financial advisory assistant. This question is not covered in the uploaded documents, so answer using your general knowledge.
-Start your response with the label "[Web]" on its own line to clearly indicate this answer is not sourced from the uploaded documents.
-Be concise, accurate, and helpful.`;
+      // 4. Build messages array with conversation history injected between system prompt and current user message
+      const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+        { role: 'system', content: systemPrompt },
+        ...conversationHistory,
+        { role: 'user', content: queryText },
+      ];
 
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: queryText },
-        ],
-        temperature: 0.3,
+        messages,
+        temperature: 0,
         max_tokens: 1000,
       });
 
@@ -144,17 +277,14 @@ Be concise, accurate, and helpful.`;
       let analyticsOutcome: string;
 
       if (usedWebFallback) {
-        // Web fallback: no citation processing, just format for readability
         processedAnswer = formatAnswer(answer);
         filteredSources = [];
-        analyticsOutcome = 'web_fallback';
+        analyticsOutcome = domain.in_domain ? 'no_chunks' : 'web_fallback';
       } else {
-        // Document-sourced: process inline citations and filter sources
         const citedPages = extractCitedPages(answer);
         processedAnswer = boldCitations(answer);
         processedAnswer = formatAnswer(processedAnswer);
 
-        // Build source candidates from ALL retrieved chunks so every cited page can be linked
         const allChunkSources = (() => {
           const seen = new Set<string>();
           const result: Array<{ filename: string; page: number; similarity: number; document_id: string }> = [];
@@ -175,9 +305,10 @@ Be concise, accurate, and helpful.`;
         analyticsOutcome = 'success';
       }
 
-      // 4. Save to chat history
+      // 5. Save to chat history with session_id
       const { error: insertError } = await supabase.from('chat_messages').insert({
         user_id: userId,
+        session_id,
         query,
         response: processedAnswer,
         sources: filteredSources,
@@ -187,7 +318,14 @@ Be concise, accurate, and helpful.`;
         console.error('Failed to save chat message:', insertError);
       }
 
-      // 5. Save to analytics (fire and forget)
+      // 6. Touch session updated_at
+      supabase
+        .from('chat_sessions')
+        .update({ updated_at: new Date().toISOString() })
+        .eq('id', session_id)
+        .then(({ error }) => { if (error) console.error('Failed to update session timestamp:', error); });
+
+      // 7. Analytics (fire and forget)
       logQueryAnalytics({
         userId,
         queryText: query,
@@ -216,16 +354,29 @@ Be concise, accurate, and helpful.`;
   }
 );
 
-// Get chat history
+// ============================================================================
+// Chat history (filtered by session, last 30 days)
+// ============================================================================
+
 router.get('/history', authenticateUser, async (req: AuthenticatedRequest, res) => {
   try {
     const userId = req.user!.id;
+    const { session_id } = req.query;
     const limit = parseInt(req.query.limit as string, 10) || 50;
+
+    // No session_id — return empty (supports old clients during transition)
+    if (!session_id) {
+      return res.json({ messages: [] });
+    }
+
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
     const { data, error } = await supabase
       .from('chat_messages')
       .select('*')
       .eq('user_id', userId)
+      .eq('session_id', session_id)
+      .gte('created_at', thirtyDaysAgo)
       .order('created_at', { ascending: false })
       .limit(limit);
 
@@ -238,7 +389,10 @@ router.get('/history', authenticateUser, async (req: AuthenticatedRequest, res) 
   }
 });
 
-// Get a signed URL to view a document in the browser
+// ============================================================================
+// Document URL
+// ============================================================================
+
 router.get('/document-url/:documentId', authenticateUser, async (req: AuthenticatedRequest, res) => {
   try {
     const { documentId } = req.params;
