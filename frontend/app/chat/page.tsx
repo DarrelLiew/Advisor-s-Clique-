@@ -18,6 +18,8 @@ import Link from "next/link";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import { api, SessionExpiredError } from "@/lib/api";
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -38,26 +40,68 @@ interface Message {
   created_at: string;
 }
 
+interface StreamFinalPayload {
+  type: "final";
+  answer: string;
+  sources: Message["sources"];
+  model?: string;
+  response_time_ms?: number;
+  chat_saved?: boolean;
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
 
 function processCitations(
   response: string,
-  sources: Array<{ page: number; document_id?: string }>,
+  sources: Array<{ page: number; document_id?: string; similarity?: number }>,
 ): string {
-  const pageToDocId: Record<number, string> = {};
+  const pageToBestSource = new Map<number, { document_id: string; similarity: number }>();
+
   for (const s of sources) {
-    if (s.document_id && !pageToDocId[s.page]) {
-      pageToDocId[s.page] = s.document_id;
+    if (!s.document_id) continue;
+    const similarity = typeof s.similarity === "number" ? s.similarity : 0;
+    const existing = pageToBestSource.get(s.page);
+    if (!existing || similarity > existing.similarity) {
+      pageToBestSource.set(s.page, { document_id: s.document_id, similarity });
     }
   }
-  return response.replace(/\[p\.(\d+)\]/g, (_match, pageStr) => {
-    const page = parseInt(pageStr, 10);
-    const docId = pageToDocId[page];
-    return docId
-      ? `[p.${page}](cite:${docId}:${page})`
-      : `[p.${page}](cite-nolink:${page})`;
+
+  const parsePages = (citationBlock: string): number[] => {
+    const content = citationBlock.slice(1, -1).replace(/^p\./i, "");
+    const segments = content.split(",").map((s) => s.trim()).filter(Boolean);
+    const pages: number[] = [];
+
+    for (const segment of segments) {
+      const normalized = segment.replace(/^p\./i, "").trim();
+      const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (rangeMatch) {
+        const start = parseInt(rangeMatch[1], 10);
+        const end = parseInt(rangeMatch[2], 10);
+        for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
+          pages.push(i);
+        }
+        continue;
+      }
+
+      const page = parseInt(normalized, 10);
+      if (!Number.isNaN(page)) pages.push(page);
+    }
+
+    return pages;
+  };
+
+  return response.replace(/\[p\.[^\]]+\]/gi, (match) => {
+    const pages = parsePages(match);
+    if (pages.length === 0) return match;
+
+    return pages.map((page) => {
+      const mapped = pageToBestSource.get(page);
+      return mapped
+        ? `[p.${page}](cite:${mapped.document_id}:${page})`
+        : `[p.${page}](cite-nolink:${page})`;
+    }).join(", ");
   });
 }
 
@@ -287,23 +331,102 @@ export default function ChatPage() {
     const queryText = input.trim();
     setInput("");
     setLoading(true);
+    const tempId = `tmp-${Date.now()}`;
+
+    const pendingMessage: Message = {
+      id: tempId,
+      query: queryText,
+      response: "",
+      sources: [],
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, pendingMessage]);
 
     try {
-      const data = await api.post<{
-        answer: string;
-        sources: Message["sources"];
-        chat_saved?: boolean;
-      }>("/api/chat/message", { query: queryText, session_id: activeSession.id });
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new SessionExpiredError();
 
-      const newMessage: Message = {
-        id: Date.now().toString(),
-        query: queryText,
-        response: data.answer,
-        sources: data.sources || [],
-        created_at: new Date().toISOString(),
-      };
+      const response = await fetch(`${API_URL}/api/chat/message/stream`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ query: queryText, session_id: activeSession.id }),
+      });
 
-      setMessages((prev) => [...prev, newMessage]);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({} as { error?: string }));
+        throw new Error(body.error || `Request failed: ${response.status}`);
+      }
+
+      if (!response.body) {
+        throw new Error("Streaming response is unavailable.");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalPayload: StreamFinalPayload | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex >= 0) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          newlineIndex = buffer.indexOf("\n");
+          if (!line) continue;
+
+          const event = JSON.parse(line) as {
+            type: "delta" | "final" | "error";
+            delta?: string;
+            error?: string;
+            answer?: string;
+            sources?: Message["sources"];
+            model?: string;
+            response_time_ms?: number;
+            chat_saved?: boolean;
+          };
+
+          if (event.type === "delta" && event.delta) {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === tempId ? { ...m, response: m.response + event.delta } : m
+              )
+            );
+            continue;
+          }
+
+          if (event.type === "error") {
+            throw new Error(event.error || "Stream failed.");
+          }
+
+          if (event.type === "final") {
+            finalPayload = event as StreamFinalPayload;
+          }
+        }
+
+        if (done) break;
+      }
+
+      if (!finalPayload) {
+        throw new Error("Stream ended before final response.");
+      }
+
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === tempId
+            ? {
+                ...m,
+                response: finalPayload!.answer,
+                sources: finalPayload!.sources || [],
+              }
+            : m
+        )
+      );
 
       // Bump session to top of list
       setSessions((prev) => {
@@ -315,6 +438,7 @@ export default function ChatPage() {
         );
       });
     } catch (error: any) {
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
       if (error instanceof SessionExpiredError) {
         router.push("/login");
         return;
@@ -518,7 +642,7 @@ export default function ChatPage() {
                                 isValidElement(first) &&
                                 (first as React.ReactElement).type === "strong";
                               return (
-                                <p className={isHeader ? "mt-4 mb-1" : "my-1"}>{children}</p>
+                                <p className={isHeader ? "mt-5 mb-2" : "my-3 leading-relaxed"}>{children}</p>
                               );
                             },
                             a: ({ href, children }) => {
@@ -540,7 +664,7 @@ export default function ChatPage() {
                               }
                               if (href?.startsWith("cite-nolink:")) {
                                 return (
-                                  <span className="inline-flex items-center gap-0.5 bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5 text-xs text-blue-600 font-medium mx-0.5 align-middle not-prose">
+                                  <span className="inline-flex items-center gap-0.5 bg-gray-100 border border-gray-200 rounded px-1.5 py-0.5 text-xs text-gray-500 font-medium mx-0.5 align-middle not-prose">
                                     <FileText className="w-3 h-3" />
                                     {children}
                                   </span>
