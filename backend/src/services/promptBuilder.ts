@@ -5,24 +5,19 @@
  */
 
 export type ChatMode = 'client' | 'learner';
-export type OutputFormat = 'markdown' | 'plaintext';
 
 /**
- * Builds a system prompt for the LLM based on context availability, mode, and format.
- *
- * - When context is available (documents found): document-based prompt with mode-specific instructions
- * - When context is missing but is_financial: web fallback prompt
+ * Builds a system prompt for the LLM based on context availability and mode.
+ * Both web and Telegram use the same prompt — only post-processing differs.
  *
  * @param context - The document context to include in the prompt (or empty string for fallback)
  * @param mode - Chat mode: 'client' (concise) or 'learner' (expanded explanations)
- * @param format - Output format: 'markdown' (web) or 'plaintext' (Telegram)
  * @param usedWebFallback - Whether this is a web fallback (financial Q not in documents)
  * @returns System prompt string to send to the LLM
  */
 export function buildSystemPrompt(
   context: string,
   mode: ChatMode,
-  format: OutputFormat,
   usedWebFallback: boolean,
 ): string {
   if (usedWebFallback) {
@@ -30,7 +25,7 @@ export function buildSystemPrompt(
     return `You are a knowledgeable financial advisory assistant. This question is not covered in the uploaded documents, so answer using your general knowledge.
 
 Start your response with the label "[Web]" on its own line to clearly indicate this answer is not sourced from the uploaded documents.
-${format === 'markdown' ? 'Format your response clearly. Be concise, accurate, and helpful.' : 'Plain text only. Be concise, accurate, and helpful.'}`;
+Format your response clearly. Be concise, accurate, and helpful.`;
   }
 
   // Document-based answer with mode differentiation
@@ -41,11 +36,29 @@ Key instructions:
 - Answer all questions factually using only the document content provided.
 - Do NOT redirect users to external help lines, and do NOT tell the user to "refer to the full document", "check other sections", or "see the complete document" — answer directly and completely from the provided context.
 - Do NOT say information "may be found in other sections" or "not included in the provided context" — work only with what you have and present it fully.
-${format === 'markdown' ? '- Format using markdown. Use bullet points or numbered lists.' : '- Plain text only. Use * for bullet points.'}
-- CRITICAL: After EACH specific fact, claim, or bullet point, immediately add an inline citation showing the page number in square brackets (e.g., [p.5] or [p.3-4]). ONLY cite page numbers that appear in the context headers below — never invent, infer, or guess page numbers for content not present in the provided context.
-- Do NOT list sources at the end - citations must be inline next to each point.
-- If the answer involves a table (e.g., premium tiers, rate schedules, benefit schedules), include ALL rows you can find in the context. If the table appears incomplete or cut off, add: "Note: This table may be partial - please verify in the source document."
-- When reading tables, carefully identify the correct column before extracting values. Do not confuse values across different columns.
+- Format using ONLY markdown (never HTML tags) with clear visual hierarchy:
+  - Use **bold** section headers (e.g., **Welcome Bonus by Plan Type**).
+  - Use bullet points with sub-bullets for grouped data.
+  - NEVER use markdown tables. Instead, use a hierarchical bullet structure with bold labels.
+  - NEVER use <b>, <i>, <u>, or any HTML tags for formatting. Use only markdown syntax (e.g., **bold**).
+  Example of CORRECT hierarchical format for tabular data:
+  **Welcome Bonus by Plan Type**
+  - **Choice 5**
+    - S$1,200 to S$2,399.99: Not Applicable
+    - S$6,000 to S$11,999.99: 15%
+  - **Choice 10**
+    - S$1,200 to S$2,399.99: Not Applicable
+    - S$2,400 to S$3,599.99: 5%
+- CRITICAL CITATION RULE: You MUST place a page citation [p.X] at the END of EVERY bullet point or sentence. NEVER group citations at the end of your response. Each bullet must end with its own citation.
+  Example of CORRECT citation placement:
+  - A premium holiday allows policyholders to stop paying premiums after the first premium. [p.19]
+  - During a premium holiday, fees continue to be deducted from the account value. [p.30]
+  Example of WRONG citation placement (DO NOT do this):
+  - A premium holiday allows policyholders to stop paying premiums.
+  - During a premium holiday, fees continue to be deducted.
+  [p.19] [p.30]
+- ONLY cite page numbers that appear in the context headers below — never invent or guess page numbers.
+- When reading tables in the source documents, carefully identify the correct column before extracting values. Do not confuse values across different columns.
 - For numeric ranges, percentages, rates, and plan-choice mappings: copy values exactly as written in context. Do NOT infer, interpolate, or shift values between choices/columns.
 - Never invent missing rows. If a row/value is not explicitly present in the provided context, state only what is explicitly present.
 - If a plan/choice is stated as "Not Applicable" with no explicit exceptions, do not add conditional percentages for that same plan/choice.
@@ -63,25 +76,60 @@ ${context}`;
 }
 
 /**
+ * Strips all HTML tags from a string (for sanitizing LLM output before markdown conversion)
+ */
+export function stripHtmlTags(input: string): string {
+  return input.replace(/<[^>]+>/g, '');
+}
+
+/**
  * Post-processes an LLM response for Telegram delivery.
- * Converts markdown formatting to plaintext while preserving citations.
+ * Converts markdown formatting to Telegram HTML while preserving citations.
+ * Used with parseMode: 'HTML' in Telegram sendMessage calls.
  *
- * @param answer - Raw LLM response (formatted as markdown)
- * @returns Telegram-compatible plaintext version
+ * @param answer - Raw LLM response (may contain markdown)
+ * @returns Telegram HTML version with <b> tags for bold/headers
  */
 export function formatForTelegram(answer: string): string {
   let formatted = answer;
 
-  // Strip markdown bold: **text** → text
-  formatted = formatted.replace(/\*\*(.+?)\*\*/g, '$1');
+  // 1. If already contains <b> tags, assume HTML and skip markdown conversion (but still escape stray < >)
+  if (/<b>.*<\/b>/.test(formatted)) {
+    // Only escape stray < and > not part of tags
+    formatted = formatted.replace(/&(?!amp;|lt;|gt;)/g, '&amp;');
+    formatted = formatted.replace(/<(?!\/?b>)/g, '&lt;');
+    formatted = formatted.replace(/(?<!<b)>/g, '&gt;');
+    return formatted;
+  }
 
-  // Convert markdown bullets to plaintext: - item → * item (already done by LLM plaintext mode, but handle anyway)
-  formatted = formatted.replace(/^- /gm, '* ');
+  // 2. Escape HTML entities in raw text FIRST (before adding our own tags)
+  formatted = formatted.replace(/&/g, '&amp;');
+  formatted = formatted.replace(/</g, '&lt;');
+  formatted = formatted.replace(/>/g, '&gt;');
 
-  // Remove markdown headers: ## Header → Header (keep the text)
-  formatted = formatted.replace(/^#{1,6}\s+/gm, '');
+  // 3. Convert markdown bold: **text** → <b>text</b> (Telegram HTML)
+  formatted = formatted.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
 
-  // Preserve [p.X] citations as-is — they will be parsed separately to generate Telegram inline keyboard buttons
+  // 4. Convert markdown headers: ## Header → <b>Header</b> on its own line
+  formatted = formatted.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');
 
-  return formatted;
+  // 5. Convert HTML bold tags in markdown (e.g., - <b>text</b>) to Telegram HTML (leave as-is)
+  // (No-op, already handled)
+
+  // 6. Convert markdown bullets (- or *) at line start to dash (Telegram supports -)
+  // (No-op, already handled)
+
+  // 7. Bold page citations: [p.19] → <b>[p.19]</b>
+  formatted = formatted.replace(/\[p\.(\d+(?:-\d+)?)\]/g, '<b>[p.$1]</b>');
+
+  // 8. Remove double <b> tags (e.g., <b><b>text</b></b>)
+  formatted = formatted.replace(/<b>\s*<b>(.*?)<\/b>\s*<\/b>/g, '<b>$1</b>');
+
+  // 9. Remove stray <b></b> pairs around nothing
+  formatted = formatted.replace(/<b>\s*<\/b>/g, '');
+
+  // 10. Remove excessive blank lines
+  formatted = formatted.replace(/\n{3,}/g, '\n\n');
+
+  return formatted.trim();
 }

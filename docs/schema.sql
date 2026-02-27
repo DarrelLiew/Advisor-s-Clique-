@@ -237,21 +237,26 @@ CREATE POLICY "Admins can view all messages"
 -- ============================================================================
 
 -- NOTE: live table uses 'timestamp' not 'created_at'. All queries must use .order('timestamp') / .gte('timestamp').
--- There is NO 'metadata' column — outcome/chunks data is not currently persisted (analyticsLog.ts drops it silently).
 CREATE TABLE IF NOT EXISTS public.question_analytics (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
   query_text TEXT NOT NULL,
   query_embedding vector(1536),
   response_time_ms INTEGER,
+  metadata JSONB DEFAULT '{}'::jsonb,
   timestamp TIMESTAMPTZ DEFAULT NOW(),
   cluster_id UUID,
   session_id TEXT
 );
 
+-- Migration-safe compatibility for older deployments
+ALTER TABLE public.question_analytics
+ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_analytics_user_id ON public.question_analytics(user_id);
 CREATE INDEX IF NOT EXISTS idx_analytics_timestamp ON public.question_analytics(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_question_analytics_outcome_expr ON public.question_analytics ((metadata->>'outcome'));
 
 -- RLS Policies
 ALTER TABLE public.question_analytics ENABLE ROW LEVEL SECURITY;

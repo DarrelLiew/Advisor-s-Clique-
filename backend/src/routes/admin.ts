@@ -4,21 +4,75 @@ import { authenticateUser, requireAdmin, AuthenticatedRequest } from '../middlew
 import { processDocument } from '../services/documentProcessor';
 import { createAuditLog } from '../utils/auditLog';
 import { uploadLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
+import {
+  checkQuestionAnalyticsMetadataAvailable,
+  getAnalyticsInsertTelemetrySnapshot,
+} from '../utils/analyticsLog';
 
 const router = Router();
 
-const UNANSWERED_OUTCOMES = new Set(['domain_gate_reject', 'web_fallback', 'no_chunks']);
+const ANALYTICS_TIMEZONE = 'Asia/Singapore';
+const SGT_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+const FINANCIAL_UNANSWERED_OUTCOMES = new Set(['web_fallback', 'no_chunks', 'no_direct_answer_in_docs']);
+const FINANCIAL_ANALYTICS_OUTCOMES = new Set(['success', 'web_fallback', 'no_chunks', 'no_direct_answer_in_docs']);
+const OFF_TOPIC_OUTCOME = 'domain_gate_reject';
+const DEFAULT_FALLBACK_CATEGORY = 'Client Recommendation Wording';
 
 const QUERY_CATEGORIES: Array<{ category: string; keywords: string[] }> = [
-  { category: 'Compliance', keywords: ['compliance', 'regulation', 'regulatory', 'kyc', 'aml', 'know your client', 'ciro', 'iiroc'] },
-  { category: 'Products', keywords: ['gic', 'mutual fund', 'etf', 'annuity', 'bond', 'stock', 'equity', 'fixed income'] },
-  { category: 'Client Suitability', keywords: ['suitability', 'risk tolerance', 'risk profile', 'time horizon', 'client profile'] },
-  { category: 'Fees', keywords: ['fee', 'fees', 'commission', 'trailer', 'expense ratio', 'mer'] },
-  { category: 'Tax', keywords: ['tax', 'capital gains', 'rrsp', 'tfsa', 'taxable'] },
-  { category: 'Retirement', keywords: ['retirement', 'pension', 'drawdown', 'income planning'] },
-  { category: 'Insurance', keywords: ['insurance', 'life insurance', 'disability', 'critical illness'] },
-  { category: 'Estate Planning', keywords: ['estate', 'will', 'trust', 'beneficiary', 'power of attorney'] },
+  {
+    category: 'KYC & Suitability',
+    keywords: ['kyc', 'suitability', 'risk profile', 'risk tolerance', 'time horizon', 'know your client', 'client profile'],
+  },
+  {
+    category: 'Product Features & Eligibility',
+    keywords: ['gic', 'mutual fund', 'etf', 'annuity', 'bond', 'stock', 'equity', 'eligibility', 'minimum investment', 'premium', 'bonus'],
+  },
+  {
+    category: 'Portfolio Construction & Allocation',
+    keywords: ['allocation', 'rebalance', 'diversification', 'portfolio mix', 'asset mix', 'model portfolio', 'weighting'],
+  },
+  {
+    category: 'Fees & Compensation',
+    keywords: ['fee', 'fees', 'commission', 'trailer', 'expense ratio', 'mer', 'spread', 'advisory fee'],
+  },
+  {
+    category: 'Performance & Benchmarks',
+    keywords: ['performance', 'return', 'benchmark', 'alpha', 'volatility', 'drawdown', 'sharpe'],
+  },
+  {
+    category: 'Compliance & Disclosure',
+    keywords: ['compliance', 'regulation', 'regulatory', 'disclosure', 'conflict', 'fiduciary', 'ciro', 'iiroc', 'aml'],
+  },
+  {
+    category: 'Account Operations & Transactions',
+    keywords: ['withdrawal', 'deposit', 'transfer', 'settlement', 'redemption', 'subscription', 'trade', 'transaction'],
+  },
+  {
+    category: 'Client Recommendation Wording',
+    keywords: ['recommend', 'proposal', 'email client', 'explain to client', 'client wording', 'how to say'],
+  },
 ];
+
+const GROUPING_STOPWORDS = new Set([
+  'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'am', 'was', 'were', 'be', 'to', 'of', 'for', 'in', 'on', 'at',
+  'with', 'about', 'how', 'what', 'which', 'who', 'whom', 'when', 'where', 'why', 'can', 'could', 'should', 'would',
+  'do', 'does', 'did', 'any', 'there', 'it', 'that', 'this', 'these', 'those', 'please', 'me', 'my', 'we', 'our',
+  'you', 'your', 'i',
+]);
+
+interface AnalyticsQueryRow {
+  query_text: string;
+  timestamp: string;
+  metadata: Record<string, unknown> | null;
+}
+
+interface GroupedQuestion {
+  question: string;
+  count: number;
+  category: string;
+  last_asked_at: string;
+}
 
 function getSingleQueryParam(value: unknown): string | null {
   if (typeof value === 'string') return value;
@@ -28,30 +82,272 @@ function getSingleQueryParam(value: unknown): string | null {
   return null;
 }
 
+function parsePositiveInt(value: unknown, defaultValue: number, maxValue: number): number {
+  const raw = getSingleQueryParam(value);
+  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return defaultValue;
+  }
+  return Math.min(parsed, maxValue);
+}
+
 function categorizeQueryText(queryText: string): string {
   const normalized = queryText.toLowerCase();
+  let bestCategory = DEFAULT_FALLBACK_CATEGORY;
+  let bestScore = 0;
+
   for (const bucket of QUERY_CATEGORIES) {
-    if (bucket.keywords.some((keyword) => normalized.includes(keyword))) {
-      return bucket.category;
+    let score = 0;
+    for (const keyword of bucket.keywords) {
+      if (normalized.includes(keyword)) score += 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestCategory = bucket.category;
     }
   }
-  return 'General';
+
+  return bestCategory;
+}
+
+function getSgNowParts(): { year: number; monthIndex: number } {
+  const sgNow = new Date(Date.now() + SGT_OFFSET_MS);
+  return {
+    year: sgNow.getUTCFullYear(),
+    monthIndex: sgNow.getUTCMonth(),
+  };
+}
+
+function getSgMonthRangeUtc(year: number, monthIndex: number): { startIso: string; endIso: string; monthKey: string } {
+  const startMs = Date.UTC(year, monthIndex, 1) - SGT_OFFSET_MS;
+  const endMs = Date.UTC(year, monthIndex + 1, 1) - SGT_OFFSET_MS;
+  const monthKey = new Date(Date.UTC(year, monthIndex, 1)).toISOString().slice(0, 7);
+
+  return {
+    startIso: new Date(startMs).toISOString(),
+    endIso: new Date(endMs).toISOString(),
+    monthKey,
+  };
+}
+
+function getSgMonthKeyFromTimestamp(timestamp: string): string {
+  const date = new Date(timestamp);
+  return new Date(date.getTime() + SGT_OFFSET_MS).toISOString().slice(0, 7);
+}
+
+function buildRecentSgMonthKeys(months: number): string[] {
+  const { year, monthIndex } = getSgNowParts();
+  const monthKeys: string[] = [];
+
+  for (let offset = months - 1; offset >= 0; offset--) {
+    const monthDate = new Date(Date.UTC(year, monthIndex - offset, 1));
+    monthKeys.push(getMonthKey(monthDate));
+  }
+
+  return monthKeys;
 }
 
 function getMonthKey(date: Date): string {
   return date.toISOString().slice(0, 7);
 }
 
-function buildRecentMonthKeys(months: number): string[] {
-  const now = new Date();
-  const monthKeys: string[] = [];
+function getRecentSgMonthRangeUtc(months: number): { startIso: string; endIso: string; monthKeys: string[] } {
+  const { year, monthIndex } = getSgNowParts();
+  const startMs = Date.UTC(year, monthIndex - (months - 1), 1) - SGT_OFFSET_MS;
+  const endMs = Date.UTC(year, monthIndex + 1, 1) - SGT_OFFSET_MS;
+  const monthKeys = buildRecentSgMonthKeys(months);
+  return {
+    startIso: new Date(startMs).toISOString(),
+    endIso: new Date(endMs).toISOString(),
+    monthKeys,
+  };
+}
 
-  for (let offset = months - 1; offset >= 0; offset--) {
-    const monthDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - offset, 1));
-    monthKeys.push(getMonthKey(monthDate));
+function getCurrentSgMonthRangeUtc(): { startIso: string; endIso: string; monthKey: string } {
+  const { year, monthIndex } = getSgNowParts();
+  return getSgMonthRangeUtc(year, monthIndex);
+}
+
+function getOutcome(metadata: Record<string, unknown> | null | undefined): string | null {
+  const outcome = metadata?.outcome;
+  return typeof outcome === 'string' ? outcome : null;
+}
+
+function normalizeForQuestionGrouping(query: string): string {
+  const cleaned = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) return '';
+
+  const tokens = cleaned
+    .split(' ')
+    .filter((token) => token.length > 1 && !GROUPING_STOPWORDS.has(token));
+
+  if (tokens.length === 0) return cleaned;
+  return tokens.join(' ');
+}
+
+function buildTokenSet(text: string): Set<string> {
+  return new Set(text.split(' ').filter(Boolean));
+}
+
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const token of a) {
+    if (b.has(token)) intersection += 1;
+  }
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function pickMostFrequentKey(counts: Map<string, number>, preferShorterText: boolean): string {
+  const entries = Array.from(counts.entries());
+  entries.sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    if (preferShorterText && a[0].length !== b[0].length) return a[0].length - b[0].length;
+    return a[0].localeCompare(b[0]);
+  });
+  return entries[0]?.[0] ?? '';
+}
+
+function mergeCounts(target: Map<string, number>, source: Map<string, number>): void {
+  for (const [key, count] of source.entries()) {
+    target.set(key, (target.get(key) || 0) + count);
+  }
+}
+
+function buildCommonQuestions(rows: AnalyticsQueryRow[], limit: number): GroupedQuestion[] {
+  interface ExactGroup {
+    normalized: string;
+    tokens: Set<string>;
+    count: number;
+    lastAskedAt: string;
+    originalCounts: Map<string, number>;
+    categoryCounts: Map<string, number>;
   }
 
-  return monthKeys;
+  interface Cluster {
+    representativeTokens: Set<string>;
+    representativeWeight: number;
+    count: number;
+    lastAskedAt: string;
+    originalCounts: Map<string, number>;
+    categoryCounts: Map<string, number>;
+  }
+
+  const exactGroupMap = new Map<string, ExactGroup>();
+
+  for (const row of rows) {
+    const question = row.query_text?.trim();
+    if (!question) continue;
+
+    const normalized = normalizeForQuestionGrouping(question);
+    if (!normalized) continue;
+
+    const tokens = buildTokenSet(normalized);
+    if (tokens.size === 0) continue;
+
+    const existing = exactGroupMap.get(normalized);
+    if (!existing) {
+      const categoryCounts = new Map<string, number>();
+      categoryCounts.set(categorizeQueryText(question), 1);
+
+      exactGroupMap.set(normalized, {
+        normalized,
+        tokens,
+        count: 1,
+        lastAskedAt: row.timestamp,
+        originalCounts: new Map<string, number>([[question, 1]]),
+        categoryCounts,
+      });
+      continue;
+    }
+
+    existing.count += 1;
+    if (row.timestamp > existing.lastAskedAt) existing.lastAskedAt = row.timestamp;
+    existing.originalCounts.set(question, (existing.originalCounts.get(question) || 0) + 1);
+    const category = categorizeQueryText(question);
+    existing.categoryCounts.set(category, (existing.categoryCounts.get(category) || 0) + 1);
+  }
+
+  const exactGroups = Array.from(exactGroupMap.values()).sort((a, b) => b.count - a.count);
+  const clusters: Cluster[] = [];
+
+  for (const group of exactGroups) {
+    let bestIndex = -1;
+    let bestSimilarity = 0;
+
+    for (let i = 0; i < clusters.length; i++) {
+      const score = jaccardSimilarity(group.tokens, clusters[i].representativeTokens);
+      if (score >= 0.72 && score > bestSimilarity) {
+        bestSimilarity = score;
+        bestIndex = i;
+      }
+    }
+
+    if (bestIndex === -1) {
+      clusters.push({
+        representativeTokens: new Set(group.tokens),
+        representativeWeight: group.count,
+        count: group.count,
+        lastAskedAt: group.lastAskedAt,
+        originalCounts: new Map(group.originalCounts),
+        categoryCounts: new Map(group.categoryCounts),
+      });
+      continue;
+    }
+
+    const cluster = clusters[bestIndex];
+    cluster.count += group.count;
+    if (group.lastAskedAt > cluster.lastAskedAt) cluster.lastAskedAt = group.lastAskedAt;
+    mergeCounts(cluster.originalCounts, group.originalCounts);
+    mergeCounts(cluster.categoryCounts, group.categoryCounts);
+
+    if (group.count > cluster.representativeWeight) {
+      cluster.representativeTokens = new Set(group.tokens);
+      cluster.representativeWeight = group.count;
+    }
+  }
+
+  return clusters
+    .map((cluster) => ({
+      question: pickMostFrequentKey(cluster.originalCounts, true),
+      count: cluster.count,
+      category: pickMostFrequentKey(cluster.categoryCounts, false) || DEFAULT_FALLBACK_CATEGORY,
+      last_asked_at: cluster.lastAskedAt,
+    }))
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      if (b.last_asked_at !== a.last_asked_at) return b.last_asked_at.localeCompare(a.last_asked_at);
+      return a.question.localeCompare(b.question);
+    })
+    .slice(0, limit);
+}
+
+async function resolveAnalyticsDiagnostics(): Promise<{
+  metadataAvailable: boolean;
+  dataQuality: 'complete' | 'partial';
+  telemetry: ReturnType<typeof getAnalyticsInsertTelemetrySnapshot>;
+}> {
+  try {
+    const metadataAvailable = await checkQuestionAnalyticsMetadataAvailable();
+    return {
+      metadataAvailable,
+      dataQuality: metadataAvailable ? 'complete' : 'partial',
+      telemetry: getAnalyticsInsertTelemetrySnapshot(),
+    };
+  } catch (error: any) {
+    console.error('Analytics metadata check failed:', error);
+    return {
+      metadataAvailable: false,
+      dataQuality: 'partial',
+      telemetry: getAnalyticsInsertTelemetrySnapshot(),
+    };
+  }
 }
 
 // Apply auth middleware to all admin routes
@@ -426,19 +722,11 @@ router.get('/dashboard/stats', async (req: AuthenticatedRequest, res) => {
       .select('*', { count: 'exact', head: true })
       .gte('timestamp', thirtyDaysAgo.toISOString());
 
-    // Get recent questions (last 10)
-    const { data: recentQuestions } = await supabase
-      .from('question_analytics')
-      .select('query_text, timestamp')
-      .order('timestamp', { ascending: false })
-      .limit(10);
-
     res.json({
       total_users: totalUsers,
       total_documents: totalDocuments || 0,
       documents_by_status: documentsByStatus,
       questions_last_30_days: questionsLast30Days || 0,
-      recent_questions: recentQuestions || [],
     });
   } catch (error: any) {
     console.error('Dashboard stats error:', error);
@@ -476,33 +764,33 @@ router.get('/analytics/monthly', async (_req: AuthenticatedRequest, res) => {
   }
 });
 
-// Unanswered / fallback analytics by month
+// Financial unanswered analytics by month (web_fallback + no_chunks)
 router.get('/analytics/unanswered', async (req: AuthenticatedRequest, res) => {
   try {
-    const monthsParam = getSingleQueryParam(req.query.months);
-    const parsedMonths = monthsParam ? Number.parseInt(monthsParam, 10) : NaN;
-    const months = Number.isInteger(parsedMonths) && parsedMonths > 0 ? Math.min(parsedMonths, 24) : 3;
-    const monthKeys = buildRecentMonthKeys(months);
+    const months = parsePositiveInt(req.query.months, 3, 24);
+    const { monthKeys, startIso, endIso } = getRecentSgMonthRangeUtc(months);
+    const diagnostics = await resolveAnalyticsDiagnostics();
 
-    const startDate = new Date(Date.UTC(
-      new Date().getUTCFullYear(),
-      new Date().getUTCMonth() - (months - 1),
-      1,
-    ));
+    if (!diagnostics.metadataAvailable) {
+      return res.json({
+        data: monthKeys.map((month) => ({ month, count: 0 })),
+        data_quality: diagnostics.dataQuality,
+        diagnostics: {
+          metadata_available: diagnostics.metadataAvailable,
+          timezone: ANALYTICS_TIMEZONE,
+          telemetry: diagnostics.telemetry,
+        },
+      });
+    }
 
     const { data, error } = await supabase
       .from('question_analytics')
       .select('timestamp, metadata')
-      .gte('timestamp', startDate.toISOString())
+      .gte('timestamp', startIso)
+      .lt('timestamp', endIso)
       .order('timestamp', { ascending: true });
 
-    if (error) {
-      const message = (error.message || '').toLowerCase();
-      if (message.includes('metadata') && (message.includes('column') || message.includes('does not exist'))) {
-        return res.json({ data: monthKeys.map((month) => ({ month, count: 0 })) });
-      }
-      throw error;
-    }
+    if (error) throw error;
 
     const counts = monthKeys.reduce<Record<string, number>>((acc, month) => {
       acc[month] = 0;
@@ -510,11 +798,11 @@ router.get('/analytics/unanswered', async (req: AuthenticatedRequest, res) => {
     }, {});
 
     for (const row of (data ?? []) as Array<{ timestamp: string; metadata: Record<string, unknown> | null }>) {
-      const month = row.timestamp?.slice(0, 7);
+      const month = getSgMonthKeyFromTimestamp(row.timestamp);
       if (!month || !(month in counts)) continue;
 
-      const outcome = row.metadata?.outcome;
-      if (typeof outcome === 'string' && UNANSWERED_OUTCOMES.has(outcome)) {
+      const outcome = getOutcome(row.metadata);
+      if (outcome && FINANCIAL_UNANSWERED_OUTCOMES.has(outcome)) {
         counts[month] += 1;
       }
     }
@@ -524,6 +812,12 @@ router.get('/analytics/unanswered', async (req: AuthenticatedRequest, res) => {
         month,
         count: counts[month] ?? 0,
       })),
+      data_quality: diagnostics.dataQuality,
+      diagnostics: {
+        metadata_available: diagnostics.metadataAvailable,
+        timezone: ANALYTICS_TIMEZONE,
+        telemetry: diagnostics.telemetry,
+      },
     });
   } catch (error: any) {
     console.error('Unanswered analytics error:', error);
@@ -531,26 +825,161 @@ router.get('/analytics/unanswered', async (req: AuthenticatedRequest, res) => {
   }
 });
 
-// Top query categories (last 30 days)
-router.get('/analytics/top-queries', async (req: AuthenticatedRequest, res) => {
+// Off-topic rejected analytics by month (domain_gate_reject only)
+router.get('/analytics/off-topic-rejected', async (req: AuthenticatedRequest, res) => {
   try {
-    const limitParam = getSingleQueryParam(req.query.limit);
-    const parsedLimit = limitParam ? Number.parseInt(limitParam, 10) : NaN;
-    const limit = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 25) : 10;
+    const months = parsePositiveInt(req.query.months, 3, 24);
+    const { monthKeys, startIso, endIso } = getRecentSgMonthRangeUtc(months);
+    const { monthKey: currentMonthKey } = getCurrentSgMonthRangeUtc();
+    const diagnostics = await resolveAnalyticsDiagnostics();
 
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    if (!diagnostics.metadataAvailable) {
+      return res.json({
+        data: monthKeys.map((month) => ({ month, count: 0 })),
+        current_month_count: 0,
+        data_quality: diagnostics.dataQuality,
+        diagnostics: {
+          metadata_available: diagnostics.metadataAvailable,
+          timezone: ANALYTICS_TIMEZONE,
+          telemetry: diagnostics.telemetry,
+        },
+      });
+    }
 
     const { data, error } = await supabase
       .from('question_analytics')
-      .select('query_text')
-      .gte('timestamp', thirtyDaysAgo)
+      .select('timestamp, metadata')
+      .gte('timestamp', startIso)
+      .lt('timestamp', endIso)
+      .order('timestamp', { ascending: true });
+
+    if (error) throw error;
+
+    const counts = monthKeys.reduce<Record<string, number>>((acc, month) => {
+      acc[month] = 0;
+      return acc;
+    }, {});
+
+    for (const row of (data ?? []) as Array<{ timestamp: string; metadata: Record<string, unknown> | null }>) {
+      const month = getSgMonthKeyFromTimestamp(row.timestamp);
+      if (!month || !(month in counts)) continue;
+      if (getOutcome(row.metadata) === OFF_TOPIC_OUTCOME) {
+        counts[month] += 1;
+      }
+    }
+
+    res.json({
+      data: monthKeys.map((month) => ({
+        month,
+        count: counts[month] ?? 0,
+      })),
+      current_month_count: counts[currentMonthKey] ?? 0,
+      data_quality: diagnostics.dataQuality,
+      diagnostics: {
+        metadata_available: diagnostics.metadataAvailable,
+        timezone: ANALYTICS_TIMEZONE,
+        telemetry: diagnostics.telemetry,
+      },
+    });
+  } catch (error: any) {
+    console.error('Off-topic analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch off-topic analytics' });
+  }
+});
+
+// Commonly asked financial questions (current Singapore calendar month)
+router.get('/analytics/common-questions', async (req: AuthenticatedRequest, res) => {
+  try {
+    const period = getSingleQueryParam(req.query.period) || 'current_month';
+    if (period !== 'current_month') {
+      return res.status(400).json({ error: 'Only period=current_month is supported' });
+    }
+
+    const limit = parsePositiveInt(req.query.limit, 10, 25);
+    const { startIso, endIso } = getCurrentSgMonthRangeUtc();
+    const diagnostics = await resolveAnalyticsDiagnostics();
+
+    if (!diagnostics.metadataAvailable) {
+      return res.json({
+        data: [],
+        window: { type: period, timezone: ANALYTICS_TIMEZONE },
+        data_quality: diagnostics.dataQuality,
+        diagnostics: {
+          metadata_available: diagnostics.metadataAvailable,
+          timezone: ANALYTICS_TIMEZONE,
+          telemetry: diagnostics.telemetry,
+        },
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('question_analytics')
+      .select('query_text, timestamp, metadata')
+      .gte('timestamp', startIso)
+      .lt('timestamp', endIso)
       .order('timestamp', { ascending: false })
-      .limit(1000);
+      .limit(2000);
+
+    if (error) throw error;
+
+    const financialRows = ((data ?? []) as AnalyticsQueryRow[])
+      .filter((row) => {
+        const outcome = getOutcome(row.metadata);
+        return outcome !== null && FINANCIAL_ANALYTICS_OUTCOMES.has(outcome);
+      });
+
+    const grouped = buildCommonQuestions(financialRows, limit);
+
+    res.json({
+      data: grouped,
+      window: { type: period, timezone: ANALYTICS_TIMEZONE },
+      data_quality: diagnostics.dataQuality,
+      diagnostics: {
+        metadata_available: diagnostics.metadataAvailable,
+        timezone: ANALYTICS_TIMEZONE,
+        telemetry: diagnostics.telemetry,
+      },
+    });
+  } catch (error: any) {
+    console.error('Common questions analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch common questions' });
+  }
+});
+
+// Top query categories (current Singapore calendar month, financial outcomes only)
+router.get('/analytics/top-queries', async (req: AuthenticatedRequest, res) => {
+  try {
+    const limit = parsePositiveInt(req.query.limit, 10, 25);
+    const { startIso, endIso } = getCurrentSgMonthRangeUtc();
+    const diagnostics = await resolveAnalyticsDiagnostics();
+
+    if (!diagnostics.metadataAvailable) {
+      return res.json({
+        data: [],
+        window: { type: 'current_month', timezone: ANALYTICS_TIMEZONE },
+        data_quality: diagnostics.dataQuality,
+        diagnostics: {
+          metadata_available: diagnostics.metadataAvailable,
+          timezone: ANALYTICS_TIMEZONE,
+          telemetry: diagnostics.telemetry,
+        },
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('question_analytics')
+      .select('query_text, metadata')
+      .gte('timestamp', startIso)
+      .lt('timestamp', endIso)
+      .order('timestamp', { ascending: false })
+      .limit(2000);
 
     if (error) throw error;
 
     const categoryCounts: Record<string, number> = {};
-    for (const row of (data ?? []) as Array<{ query_text: string }>) {
+    for (const row of (data ?? []) as Array<{ query_text: string; metadata: Record<string, unknown> | null }>) {
+      const outcome = getOutcome(row.metadata);
+      if (!outcome || !FINANCIAL_ANALYTICS_OUTCOMES.has(outcome)) continue;
       const category = categorizeQueryText(row.query_text || '');
       categoryCounts[category] = (categoryCounts[category] || 0) + 1;
     }
@@ -560,7 +989,16 @@ router.get('/analytics/top-queries', async (req: AuthenticatedRequest, res) => {
       .slice(0, limit)
       .map(([category, count]) => ({ category, count }));
 
-    res.json({ data: ranked });
+    res.json({
+      data: ranked,
+      window: { type: 'current_month', timezone: ANALYTICS_TIMEZONE },
+      data_quality: diagnostics.dataQuality,
+      diagnostics: {
+        metadata_available: diagnostics.metadataAvailable,
+        timezone: ANALYTICS_TIMEZONE,
+        telemetry: diagnostics.telemetry,
+      },
+    });
   } catch (error: any) {
     console.error('Top query categories error:', error);
     res.status(500).json({ error: 'Failed to fetch top query categories' });

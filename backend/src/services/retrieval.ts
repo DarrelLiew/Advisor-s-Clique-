@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+﻿import OpenAI from 'openai';
 import { supabase } from '../lib/supabase';
 import { ragConfig } from './ragConfig';
 
@@ -23,11 +23,156 @@ type DomainClassification = {
   reason: string;
 };
 
+// ============================================================================
+// OPTIMIZATION: In-memory caches for embeddings and classification
+// ============================================================================
+
+// Simple LRU cache for embeddings (max 200 entries, ~1.2MB memory)
+class LRUCache<K, V> {
+  private map: Map<K, V>;
+  private maxSize: number;
+
+  constructor(maxSize: number = 200) {
+    this.map = new Map();
+    this.maxSize = maxSize;
+  }
+
+  get(key: K): V | undefined {
+    const value = this.map.get(key);
+    if (value !== undefined) {
+      this.map.delete(key);
+      this.map.set(key, value); // Move to end (most recent)
+    }
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.maxSize) {
+      const firstKey = this.map.keys().next().value as K;
+      if (firstKey !== undefined) {
+        this.map.delete(firstKey); // Evict oldest
+      }
+    }
+    this.map.set(key, value);
+  }
+
+  has(key: K): boolean {
+    return this.map.has(key);
+  }
+}
+
+const embeddingCache = new LRUCache<string, number[]>(200);
+
+// Classification cache with TTL (2 minutes)
+interface CachedClassification {
+  result: DomainClassification;
+  expiresAt: number;
+}
+const classificationCache = new Map<string, CachedClassification>();
+
+function getCacheKeyForClassification(queryText: string): string {
+  return queryText.toLowerCase().trim();
+}
+
+function getCachedClassification(queryText: string): DomainClassification | null {
+  const key = getCacheKeyForClassification(queryText);
+  const cached = classificationCache.get(key);
+  if (!cached) return null;
+  if (Date.now() > cached.expiresAt) {
+    classificationCache.delete(key);
+    return null;
+  }
+  return cached.result;
+}
+
+function setCachedClassification(queryText: string, result: DomainClassification): void {
+  const key = getCacheKeyForClassification(queryText);
+  classificationCache.set(key, {
+    result,
+    expiresAt: Date.now() + 2 * 60 * 1000, // 2-minute TTL
+  });
+}
+
+const FINANCIAL_FAST_PATH_TERMS = [
+  'premium',
+  'policy',
+  'investment',
+  'investing',
+  'portfolio',
+  'allocation',
+  'mutual fund',
+  'etf',
+  'bond',
+  'equity',
+  'gic',
+  'mer',
+  'fee',
+  'fees',
+  'commission',
+  'suitability',
+  'kyc',
+  'compliance',
+  'disclosure',
+  'withdrawal',
+  'deposit',
+  'transfer',
+  'redemption',
+  'subscription',
+  'benchmark',
+  'returns',
+  'annuity',
+  'wealth advantage',
+  'great eastern',
+  'tpd',
+  'terminal illness',
+  'welcome bonus',
+  'loyalty bonus',
+  'premium holiday',
+];
+
+function isClearlyFinancialQuery(query: string): boolean {
+  const normalized = query.toLowerCase();
+  return FINANCIAL_FAST_PATH_TERMS.some((term) => normalized.includes(term));
+}
+
+const REWRITE_CONTEXT_DEPENDENT_PATTERN =
+  /\b(it|this|that|these|those|they|them|their|he|she|its|there|here|same|again|above|below|previous|earlier|latter|former|more|elaborate|clarify)\b/i;
+const CLEAR_OFF_TOPIC_PATTERN =
+  /\b(super bowl|nba|nfl|epl|mlb|nhl|score|match result|weather|temperature|rain|recipe|cook|restaurant|movie|film|netflix|music|song|celebrity|gossip|travel itinerary|flight status|game walkthrough)\b/i;
+
+function shouldBypassRewriteModel(
+  queryText: string,
+  conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
+): boolean {
+  const hasHistory = Boolean(conversationHistory && conversationHistory.length > 0);
+  if (hasHistory) return false;
+
+  const normalized = queryText.trim().toLowerCase();
+  if (!normalized) return true;
+  if (REWRITE_CONTEXT_DEPENDENT_PATTERN.test(normalized)) return false;
+
+  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
+  if (wordCount <= 3) return false;
+  if (normalized.length > 220) return false;
+
+  return true;
+}
+
+function hasClearOffTopicSignal(query: string): boolean {
+  return CLEAR_OFF_TOPIC_PATTERN.test(query.toLowerCase());
+}
+
 export async function rewriteQueryForRetrieval(
   openai: OpenAI,
   queryText: string,
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
 ): Promise<string> {
+  if (shouldBypassRewriteModel(queryText, conversationHistory)) {
+    return queryText;
+  }
+
   try {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
@@ -54,7 +199,7 @@ export async function rewriteQueryForRetrieval(
       model: 'gpt-4o-mini',
       messages,
       temperature: 0,
-      max_tokens: 150,
+      max_tokens: 80, // Reduced from 150 — rewrites are short (10-30 tokens typical)
     });
 
     return correction.choices[0].message.content?.trim() || queryText;
@@ -64,7 +209,7 @@ export async function rewriteQueryForRetrieval(
 }
 
 function heuristicDomainClassification(_query: string): DomainClassification {
-  // Conservative fallback when LLM classification fails — default to in-domain.
+  // Conservative fallback when LLM classification fails â€” default to in-domain.
   return { in_domain: true, is_financial: true, reason: 'Defaulting to in-domain — LLM classification unavailable.' };
 }
 
@@ -73,6 +218,21 @@ export async function classifyQueryDomain(
   queryText: string,
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
 ): Promise<DomainClassification> {
+  if (isClearlyFinancialQuery(queryText)) {
+    return {
+      in_domain: true,
+      is_financial: true,
+      reason: 'Heuristic fast-path: financial keyword match.',
+    };
+  }
+
+  // Option E: Check classification cache (2-minute TTL)
+  const cached = getCachedClassification(queryText);
+  if (cached) {
+    console.log(`[CLASSIFY][retrieval] cache_hit=true query="${queryText}"`);
+    return cached;
+  }
+
   try {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
@@ -80,7 +240,7 @@ export async function classifyQueryDomain(
         content:
           'You are a query classifier for a financial advisory assistant. Classify each query into one of three tiers:\n' +
           '1. in_domain=true, is_financial=true: Query is related to topics likely covered in uploaded advisory documents (compliance, products, client processes, regulations, internal procedures).\n' +
-          '2. in_domain=false, is_financial=true: Query is a general finance/business question (e.g. "What is a GIC?", "How do bonds work?", "What is MER?") — relevant to advisory work but unlikely to be in uploaded docs.\n' +
+          '2. in_domain=false, is_financial=true: Query is a general finance/business question (e.g. "What is a GIC?", "How do bonds work?", "What is MER?") â€” relevant to advisory work but unlikely to be in uploaded docs.\n' +
           '3. in_domain=false, is_financial=false: Query has NO connection to finance, business, or professional advisory work (e.g. sports scores, cooking, weather, entertainment). These should be rejected.\n' +
           'When in doubt between tier 1 and 2, choose tier 1. Only use tier 3 for clearly non-professional, non-financial topics.\n' +
           'If conversation history is provided, use it to understand the context of the query. A short or ambiguous query that follows a financial/advisory conversation should be classified as tier 1 or tier 2, not tier 3.\n' +
@@ -102,7 +262,7 @@ export async function classifyQueryDomain(
       model: 'gpt-4o-mini',
       messages,
       temperature: 0,
-      max_tokens: 150,
+      max_tokens: 50, // Reduced from 150 — classifier output is just ~25 tokens: {"in_domain":true,"is_financial":false}
     });
 
     const raw = completion.choices[0].message.content?.trim();
@@ -117,20 +277,61 @@ export async function classifyQueryDomain(
       return heuristicDomainClassification(queryText);
     }
 
-    return {
+    const modelIsFinancial = typeof parsed.is_financial === 'boolean' ? parsed.is_financial : true;
+    const modelReason = typeof parsed.reason === 'string' && parsed.reason.trim().length > 0
+      ? parsed.reason
+      : 'Domain classified by model.';
+
+    // Safety override: avoid false reject on ambiguous short queries.
+    // We only allow hard reject when there is a clear off-topic lexical signal.
+    if (!parsed.in_domain && !modelIsFinancial && !hasClearOffTopicSignal(queryText)) {
+      const result = {
+        in_domain: true,
+        is_financial: true,
+        reason: `Safety override applied: ${modelReason}`,
+      };
+      setCachedClassification(queryText, result);
+      return result;
+    }
+
+    const result = {
       in_domain: parsed.in_domain,
-      is_financial: typeof parsed.is_financial === 'boolean' ? parsed.is_financial : true,
-      reason: typeof parsed.reason === 'string' && parsed.reason.trim().length > 0
-        ? parsed.reason
-        : 'Domain classified by model.',
+      is_financial: modelIsFinancial,
+      reason: modelReason,
     };
+    // Option E: Cache the result (2-minute TTL)
+    setCachedClassification(queryText, result);
+    return result;
   } catch {
     return heuristicDomainClassification(queryText);
   }
 }
 
 function toContext(chunks: RetrievedChunk[]): string {
-  return chunks
+  const selected: RetrievedChunk[] = [];
+  let totalChars = 0;
+
+  for (const chunk of chunks) {
+    if (selected.length >= ragConfig.maxContextChunks) break;
+
+    const block = `[${chunk.filename}, Page ${chunk.page_number}]\n${chunk.text}`;
+    const separatorLength = selected.length === 0 ? 0 : '\n\n---\n\n'.length;
+    const nextTotal = totalChars + separatorLength + block.length;
+
+    if (nextTotal > ragConfig.maxContextChars) {
+      if (selected.length === 0) {
+        const header = `[${chunk.filename}, Page ${chunk.page_number}]\n`;
+        const remaining = Math.max(0, ragConfig.maxContextChars - header.length);
+        return `${header}${chunk.text.slice(0, remaining)}`;
+      }
+      break;
+    }
+
+    selected.push(chunk);
+    totalChars = nextTotal;
+  }
+
+  return selected
     .map((chunk) => `[${chunk.filename}, Page ${chunk.page_number}]\n${chunk.text}`)
     .join('\n\n---\n\n');
 }
@@ -166,11 +367,23 @@ export async function retrieveContextForQuery(params: {
   const { openai, queryText, logLabel, conversationHistory } = params;
   const rewrittenQuery = await rewriteQueryForRetrieval(openai, queryText, conversationHistory);
 
-  const embeddingResponse = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: rewrittenQuery,
-  });
-  const queryEmbedding = embeddingResponse.data[0].embedding;
+  // Option C: Check embedding cache first
+  let queryEmbedding: number[];
+  const embedStart = Date.now();
+  const cachedEmbedding = embeddingCache.get(rewrittenQuery);
+  if (cachedEmbedding) {
+    queryEmbedding = cachedEmbedding;
+    console.log(`[EMBED][${logLabel}] cache_hit=true query="${rewrittenQuery.substring(0, 60)}..."`);
+  } else {
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: rewrittenQuery,
+    });
+    queryEmbedding = embeddingResponse.data[0].embedding;
+    embeddingCache.set(rewrittenQuery, queryEmbedding);
+    const embedMs = Date.now() - embedStart;
+    console.log(`[EMBED][${logLabel}] cache_miss=true embed_ms=${embedMs} query="${rewrittenQuery.substring(0, 60)}..."`);
+  }
 
   const { data, error } = await supabase.rpc('search_documents', {
     query_embedding: queryEmbedding,
@@ -189,12 +402,13 @@ export async function retrieveContextForQuery(params: {
     similarity: chunk.similarity,
   }));
 
-  // Page-expansion: fetch all chunks from pages that had a strong vector match.
-  // This ensures split tables/lists are always retrieved in full.
-  const strongChunks = chunks.filter((c) => c.similarity >= 0.50);
-  if (strongChunks.length > 0) {
-    const docIds = [...new Set(strongChunks.map((c) => c.document_id))];
-    const pageNums = [...new Set(strongChunks.map((c) => c.page_number))];
+  // Page-expansion: fetch all chunks from a capped set of high-confidence pages.
+  // This keeps table/list reconstruction while reducing latency and context size.
+  const vectorMatchedChunks = chunks.filter((c) => c.similarity >= 0.50);
+  const expansionSeedChunks = vectorMatchedChunks.slice(0, ragConfig.maxVectorMatchesForExpansion);
+  if (expansionSeedChunks.length > 0) {
+    const docIds = [...new Set(expansionSeedChunks.map((c) => c.document_id))];
+    const pageNums = [...new Set(expansionSeedChunks.map((c) => c.page_number))].slice(0, ragConfig.maxPagesForExpansion);
 
     const { data: pageData } = await supabase.rpc('get_chunks_by_pages', {
       doc_ids: docIds,
@@ -225,7 +439,7 @@ export async function retrieveContextForQuery(params: {
 
   console.log(
     `[RAG][${logLabel}] query="${queryText}" rewritten="${rewrittenQuery}" chunks=${chunks.length} ` +
-    `(${strongChunks.length} vector, ${chunks.length - strongChunks.length} page-expanded) ` +
+    `(${vectorMatchedChunks.length} vector, ${chunks.length - vectorMatchedChunks.length} page-expanded) ` +
     `top=${chunks.slice(0, 5).map((c) => `${c.filename}:p${c.page_number}@${c.similarity.toFixed(3)}`).join(', ')}`
   );
 
@@ -236,3 +450,5 @@ export async function retrieveContextForQuery(params: {
     sources: buildSources(chunks),
   };
 }
+
+

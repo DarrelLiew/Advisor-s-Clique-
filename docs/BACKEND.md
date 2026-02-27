@@ -220,8 +220,12 @@ Account linking flow:
 | GET | `/documents` | — | `{ documents: Document[] }` |
 | GET | `/documents/:id/status` | — | `{ processing_status, error_message, total_chunks, total_pages }` |
 | DELETE | `/documents/:id` | — | `{ success: true }` |
-| GET | `/dashboard/stats` | — | `{ total_users, total_documents, documents_by_status, questions_last_30_days, recent_questions }` |
+| GET | `/dashboard/stats` | — | `{ total_users, total_documents, documents_by_status, questions_last_30_days }` |
 | GET | `/analytics/monthly` | — | `{ data: [{ month, questions }] }` |
+| GET | `/analytics/unanswered?months=3` | — | `{ data, data_quality, diagnostics }` |
+| GET | `/analytics/off-topic-rejected?months=3` | — | `{ data, current_month_count, data_quality, diagnostics }` |
+| GET | `/analytics/common-questions?limit=10&period=current_month` | — | `{ data: [{ question, count, category, last_asked_at }], window, data_quality, diagnostics }` |
+| GET | `/analytics/top-queries?limit=10` | — | `{ data: [{ category, count }], window, data_quality, diagnostics }` |
 
 ### `/api/telegram`
 

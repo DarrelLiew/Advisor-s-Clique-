@@ -20,8 +20,14 @@ const chunkOverlap = Math.min(
 
 export const ragConfig = {
   matchThreshold: Math.min(0.99, Math.max(0, parseNumberEnv('RAG_MATCH_THRESHOLD', 0.38))),
-  matchCount: Math.max(1, parseIntEnv('RAG_MATCH_COUNT', 10)),
+  matchCount: Math.max(1, parseIntEnv('RAG_MATCH_COUNT', 6)),
   minSourceSimilarity: Math.min(0.99, Math.max(0, parseNumberEnv('RAG_MIN_SOURCE_SIMILARITY', 0.45))),
+  maxVectorMatchesForExpansion: Math.max(1, parseIntEnv('RAG_MAX_VECTOR_MATCHES_FOR_EXPANSION', 6)),
+  maxPagesForExpansion: Math.max(1, parseIntEnv('RAG_MAX_PAGES_FOR_EXPANSION', 6)),
+  maxContextChunks: Math.max(1, parseIntEnv('RAG_MAX_CONTEXT_CHUNKS', 14)),
+  maxContextChars: Math.max(1000, parseIntEnv('RAG_MAX_CONTEXT_CHARS', 18000)),
+  generationMaxTokensClient: Math.max(128, parseIntEnv('RAG_GENERATION_MAX_TOKENS_CLIENT', 500)),
+  generationMaxTokensLearner: Math.max(128, parseIntEnv('RAG_GENERATION_MAX_TOKENS_LEARNER', 650)),
   chunkSize,
   chunkOverlap,
 };

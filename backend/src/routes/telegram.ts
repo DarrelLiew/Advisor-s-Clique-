@@ -8,7 +8,8 @@ import { classifyQueryDomain, retrieveContextForQuery } from '../services/retrie
 import { telegramLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
-import { buildSystemPrompt, formatForTelegram } from '../services/promptBuilder';
+import { buildSystemPrompt, formatForTelegram, stripHtmlTags } from '../services/promptBuilder';
+import { ragConfig } from '../services/ragConfig';
 
 const router = Router();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -17,26 +18,61 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET!;
 const MAX_MESSAGE_LENGTH = 4000;
+const NO_DIRECT_DOC_ANSWER_REGEX = /(does not explicitly|not explicitly|not specified|cannot be determined from the document|document does not (?:state|specify|provide))/i;
+const LOW_RELEVANCE_NOTE = 'The documents do not explicitly provide a direct answer; this is the closest guidance from related sections.';
+
+function elapsedMs(start: number): number {
+  return Date.now() - start;
+}
+
+function isNoDirectAnswerInDocs(answer: string): boolean {
+  return NO_DIRECT_DOC_ANSWER_REGEX.test(answer);
+}
+
+function prependLowRelevanceNote(answer: string): string {
+  if (NO_DIRECT_DOC_ANSWER_REGEX.test(answer)) return answer;
+  return `${LOW_RELEVANCE_NOTE}\n\n${answer}`;
+}
 
 async function sendMessage(
   chatId: number,
   text: string,
-  replyMarkup?: object
+  replyMarkup?: object,
+  parseMode?: 'HTML'
 ): Promise<void> {
-  await axios.post(`${TELEGRAM_API}/sendMessage`, {
+  const payload: Record<string, unknown> = {
     chat_id: chatId,
     text,
     reply_markup: replyMarkup,
-  });
+  };
+  if (parseMode) payload.parse_mode = parseMode;
+  console.log(`[TELEGRAM][sendMessage] parse_mode=${parseMode || 'none'} text_length=${text.length} has_html_tags=${/<b>/.test(text)}`);
+  try {
+    await axios.post(`${TELEGRAM_API}/sendMessage`, payload);
+  } catch (err: any) {
+    // If HTML parse fails, strip tags and retry as plain text
+    if (parseMode && err?.response?.status === 400) {
+      console.warn(`[TELEGRAM] HTML send failed, retrying as plain text: ${err?.response?.data?.description || err.message}`);
+      const plainText = text.replace(/<\/?b>/g, '');
+      await axios.post(`${TELEGRAM_API}/sendMessage`, {
+        chat_id: chatId,
+        text: plainText,
+        reply_markup: replyMarkup,
+      });
+      return;
+    }
+    throw err;
+  }
 }
 
 async function sendLongMessage(
   chatId: number,
   text: string,
-  replyMarkup?: object
+  replyMarkup?: object,
+  parseMode?: 'HTML'
 ): Promise<void> {
   if (text.length <= MAX_MESSAGE_LENGTH) {
-    await sendMessage(chatId, text, replyMarkup);
+    await sendMessage(chatId, text, replyMarkup, parseMode);
     return;
   }
 
@@ -44,27 +80,101 @@ async function sendLongMessage(
   const splitAt = firstPart.lastIndexOf('\n');
   const cutAt = splitAt > MAX_MESSAGE_LENGTH * 0.7 ? splitAt : MAX_MESSAGE_LENGTH;
 
-  await sendMessage(chatId, text.slice(0, cutAt));
-  await sendLongMessage(chatId, text.slice(cutAt).trimStart(), replyMarkup);
+  await sendMessage(chatId, text.slice(0, cutAt), undefined, parseMode);
+  await sendLongMessage(chatId, text.slice(cutAt).trimStart(), replyMarkup, parseMode);
 }
 
-// Extract page numbers from inline citations [p.X] in the answer
+// Extract page numbers from inline citations.
+// Supports: [p.4], [p.4-5], [p.4-5, p.46], [p.4,5,6]
 function extractCitedPages(answer: string): number[] {
-  const pageMatches = answer.match(/\[p\.(\d+)(?:-(\d+))?\]/g) || [];
   const pages = new Set<number>();
+  const bracketCitations = answer.match(/\[p\.[^\]]+\]/gi) || [];
 
-  pageMatches.forEach((match) => {
-    const pageRange = match.match(/\d+/g);
-    if (pageRange) {
-      const start = parseInt(pageRange[0], 10);
-      const end = pageRange[1] ? parseInt(pageRange[1], 10) : start;
-      for (let i = start; i <= end; i++) {
-        pages.add(i);
+  bracketCitations.forEach((match) => {
+    const content = match.slice(1, -1).replace(/^p\./i, '');
+    const segments = content.split(',').map((s) => s.trim()).filter(Boolean);
+
+    for (const segment of segments) {
+      const normalized = segment.replace(/^p\./i, '').trim();
+      const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
+      if (rangeMatch) {
+        const start = parseInt(rangeMatch[1], 10);
+        const end = parseInt(rangeMatch[2], 10);
+        for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
+          pages.add(i);
+        }
+        continue;
+      }
+
+      const page = parseInt(normalized, 10);
+      if (!Number.isNaN(page)) {
+        pages.add(page);
       }
     }
   });
 
   return Array.from(pages).sort((a, b) => a - b);
+}
+
+function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
+  let max = 0;
+  for (const chunk of chunks) {
+    if (chunk.similarity > max) max = chunk.similarity;
+  }
+  return max;
+}
+
+function resolveSourcesForCitations(
+  chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string }>,
+  citedPages: number[],
+): Array<{ filename: string; page: number; document_id: string }> {
+  if (citedPages.length === 0) return [];
+
+  const bestByPage = new Map<number, { filename: string; page: number; similarity: number; document_id: string }>();
+  let topChunk: { filename: string; page_number: number; similarity: number; document_id: string } | null = null;
+
+  for (const chunk of chunks) {
+    if (!topChunk || chunk.similarity > topChunk.similarity) {
+      topChunk = chunk;
+    }
+
+    const existing = bestByPage.get(chunk.page_number);
+    if (!existing || chunk.similarity > existing.similarity) {
+      bestByPage.set(chunk.page_number, {
+        filename: chunk.filename,
+        page: chunk.page_number,
+        similarity: chunk.similarity,
+        document_id: chunk.document_id,
+      });
+    }
+  }
+
+  const resolved: Array<{ filename: string; page: number; document_id: string }> = [];
+  const seen = new Set<string>();
+
+  for (const page of citedPages) {
+    const mapped = bestByPage.get(page);
+    const source = mapped || (topChunk
+      ? {
+        filename: topChunk.filename,
+        page,
+        similarity: topChunk.similarity,
+        document_id: topChunk.document_id,
+      }
+      : null);
+    if (!source) continue;
+
+    const key = `${source.document_id}:${page}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    resolved.push({
+      filename: source.filename,
+      page: source.page,
+      document_id: source.document_id,
+    });
+  }
+
+  return resolved;
 }
 
 async function handleStart(chatId: number, firstName: string): Promise<void> {
@@ -151,6 +261,7 @@ async function handleQuery(
 
   const userId = profile.id;
   const startTime = Date.now();
+  const timings: Record<string, number> = {};
 
   // Fetch last 2 messages for lightweight conversation context (2 exchanges)
   const { data: historyRows } = await supabase
@@ -170,7 +281,9 @@ async function handleQuery(
   }
 
   // 1. Classify domain — three-tier: in-docs / financial-general / off-topic
+  const classifyStart = Date.now();
   const domain = await classifyQueryDomain(openai, queryText, conversationHistory);
+  timings.classification_ms = elapsedMs(classifyStart);
   let usedWebFallback = false;
   let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
 
@@ -182,20 +295,24 @@ async function handleQuery(
   }
 
   // Always attempt retrieval for any financial query — let vector search decide
+  const retrievalStart = Date.now();
   retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram', conversationHistory });
+  timings.retrieval_ms = elapsedMs(retrievalStart);
   if (!retrieval.context) {
     usedWebFallback = true;
   }
 
   // 2. Build system prompt using unified builder (same as web app, only formatting differs)
   // Telegram always uses client mode (concise) and plaintext format
+  const promptBuildStart = Date.now();
   const systemPrompt = buildSystemPrompt(
     retrieval?.context || '',
     'client', // Telegram always uses client mode (concise)
-    'plaintext', // Telegram uses plaintext format
     usedWebFallback,
   );
+  timings.prompt_build_ms = elapsedMs(promptBuildStart);
 
+  const llmStart = Date.now();
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
@@ -204,37 +321,32 @@ async function handleQuery(
       { role: 'user', content: queryText },
     ],
     temperature: 0,
-    max_tokens: 1000,
+    max_tokens: ragConfig.generationMaxTokensClient,
   });
+  timings.llm_ms = elapsedMs(llmStart);
 
   let answer = completion.choices[0].message.content ?? 'No response generated.';
+  // Sanitize: strip HTML tags from LLM output before formatting for Telegram
+  answer = stripHtmlTags(answer);
+  const maxVectorSimilarity = retrieval ? getMaxVectorSimilarity(retrieval.chunks) : 0;
+  const lowRelevance = !usedWebFallback && maxVectorSimilarity < ragConfig.minSourceSimilarity;
+  if (lowRelevance) {
+    answer = prependLowRelevanceNote(answer);
+  }
+  const noDirectAnswer = isNoDirectAnswerInDocs(answer);
   const responseTime = Date.now() - startTime;
 
-  // 3. Format answer for Telegram (strip markdown, convert plaintext)
-  answer = formatForTelegram(answer);
+  // 3. Format answer for Telegram (shared formatter — same structure as web, HTML markup)
+  const telegramFormattedAnswer = formatForTelegram(answer);
 
   // 4. Build inline keyboard buttons (only for document-sourced answers)
   let replyMarkup: object | undefined;
 
   if (!usedWebFallback && retrieval) {
+    const citationProcessStart = Date.now();
     const citedPages = extractCitedPages(answer);
-    const citedSources: Array<{ filename: string; page: number; document_id: string }> = [];
-
-    // Build a set of unique sources from retrieved chunks that match cited pages
-    const seen = new Set<string>();
-    for (const chunk of retrieval.chunks) {
-      if (citedPages.includes(chunk.page_number)) {
-        const key = `${chunk.filename}:${chunk.page_number}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          citedSources.push({
-            filename: chunk.filename,
-            page: chunk.page_number,
-            document_id: chunk.document_id,
-          });
-        }
-      }
-    }
+    const citedSources = resolveSourcesForCitations(retrieval.chunks, citedPages);
+    timings.citation_mapping_ms = elapsedMs(citationProcessStart);
 
     const buttons: Array<{ text: string; url: string }> = [];
     for (const source of citedSources) {
@@ -260,26 +372,35 @@ async function handleQuery(
     replyMarkup = inline_keyboard.length > 0 ? { inline_keyboard } : undefined;
   }
 
-  await sendLongMessage(chatId, answer, replyMarkup);
+  console.log(`[TELEGRAM][format] raw_answer_preview="${answer.substring(0, 200)}" formatted_preview="${telegramFormattedAnswer.substring(0, 200)}"`);
+  await sendLongMessage(chatId, telegramFormattedAnswer, replyMarkup, 'HTML');
 
+  const saveStart = Date.now();
   await supabase.from('chat_messages').insert({
     user_id: userId,
     query: queryText,
-    response: answer,
+    response: telegramFormattedAnswer,
     sources: retrieval?.sources ?? [],
   });
+  timings.chat_save_ms = elapsedMs(saveStart);
 
   logQueryAnalytics({
     userId,
     queryText,
     responseTimeMs: responseTime,
     metadata: {
-      outcome: usedWebFallback ? (domain.in_domain ? 'no_chunks' : 'web_fallback') : 'success',
+      outcome: usedWebFallback
+        ? (domain.in_domain ? 'no_chunks' : 'web_fallback')
+        : ((noDirectAnswer || lowRelevance) ? 'no_direct_answer_in_docs' : 'success'),
       rewritten_query: retrieval?.rewrittenQuery ?? null,
       chunks_retrieved: retrieval?.chunks.length ?? 0,
       source_count: retrieval?.sources.length ?? 0,
     },
   });
+
+  console.log(
+    `[PERF][telegram] total_ms=${responseTime} classification_ms=${timings.classification_ms ?? 0} retrieval_ms=${timings.retrieval_ms ?? 0} prompt_build_ms=${timings.prompt_build_ms ?? 0} llm_ms=${timings.llm_ms ?? 0} citation_mapping_ms=${timings.citation_mapping_ms ?? 0} chat_save_ms=${timings.chat_save_ms ?? 0} outcome=${usedWebFallback ? (domain.in_domain ? 'no_chunks' : 'web_fallback') : ((noDirectAnswer || lowRelevance) ? 'no_direct_answer_in_docs' : 'success')} chunks=${retrieval?.chunks.length ?? 0} sources=${retrieval?.sources.length ?? 0}`
+  );
 }
 
 function validateWebhookSecret(req: Request, res: Response, next: Function): void {
