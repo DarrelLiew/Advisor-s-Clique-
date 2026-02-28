@@ -1,65 +1,155 @@
-x# Advisors Clique — Implementation Plan
+# CLAUDE.md
 
-> Run these tasks **one at a time**, confirming user acceptance before moving to the next.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
----
+## Project Overview
 
-## Context
+Advisors Clique is a RAG-powered AI chatbot for financial advisors. Users ask questions about uploaded PDF documents and get answers with page citations. It supports both a web app and a Telegram bot.
 
-The prototype has several bottlenecks identified in the product review meeting:
+## Tech Stack
 
-1. Domain filter is too strict — rejects valid financial advisory questions
-2. No conversation memory — each message is stateless
-3. No multi-chat session support
-4. No Learner/Client mode toggle per chat
-5. Telegram and web app use different prompts (code inconsistency)
-6. Analytics missing: unanswered questions + top query types
-7. User invitation flow requires admin to manually copy magic links — needs direct email invite with self-service password setup
+- **Frontend:** Next.js 14 (App Router), React 18, TailwindCSS, Supabase Auth (`@supabase/ssr`)
+- **Backend:** Express.js + TypeScript, OpenAI (`gpt-4o-mini` for generation, `text-embedding-3-small` for embeddings), Supabase service-role client
+- **Database:** Supabase PostgreSQL + pgvector (1536-dim embeddings), RLS enabled on all tables
+- **Bot:** Telegram webhook bot (Express route, not standalone process)
+- **Monorepo:** Root `package.json` uses `concurrently` to run both frontend and backend
 
----
+## Commands
 
-## Task 1: Loosen Domain Filter + Web Source Label ✅ DONE (with correction below)
+```bash
+# Install all dependencies (root + frontend + backend)
+npm run install:all
 
-**Goal:** Three-tier response strategy:
+# Development (runs frontend :3000 + backend :3001 concurrently)
+npm run dev
 
-1. **In documents** → normal doc answer with page citations
-2. **Finance/business related but NOT in documents** → answer from general LLM knowledge, labelled `[Web]`
-3. **Completely off-topic** (sports scores, cooking, entertainment, weather) → politely reject with scope message
+# Run only frontend or backend
+npm run dev:frontend    # next dev on port 3000
+npm run dev:backend     # nodemon with ts-node on port 3001
 
-> **Clarification:** `[Web]` is ONLY for finance/business questions not covered by uploaded docs. Completely unrelated questions (e.g., "Who won the Super Bowl?") are still rejected — they have no relevance to advisory work.
+# Build
+npm run build           # builds both frontend and backend
 
-### Three-Tier Classification in `classifyQueryDomain()`
+# Type checking
+npm run type-check      # runs tsc --noEmit on both
 
-Return an extended type: `{ in_domain: boolean, is_financial: boolean, reason: string }`
+# Lint (frontend only)
+cd frontend && npm run lint
+```
 
-- `in_domain: true` → topic covered or likely covered in docs, attempt retrieval
-- `in_domain: false, is_financial: true` → financial/business topic, no retrieval, answer with `[Web]`
-- `in_domain: false, is_financial: false` → completely off-topic, reject with scope message
+There are no test suites configured.
 
-### Conversation-Aware Classification & Retrieval
+## Architecture
 
-Both `classifyQueryDomain()` and `rewriteQueryForRetrieval()` accept optional `conversationHistory` (last 2 exchanges). This prevents ambiguous follow-up queries (e.g., "what is choice 5, 10, 15?") from being incorrectly rejected. The query rewriter also uses history to produce self-contained search queries from vague follow-ups.
+### Request Flow (Web Chat)
 
-- **Web chat:** passes session conversation history to classifier + retrieval
-- **Telegram:** fetches last 2 messages (no session_id) for lightweight memory, passes to classifier + retrieval + LLM call
+```
+Frontend (Next.js) → POST /api/chat/message → auth middleware (Supabase JWT)
+  → classifyQueryDomain() (3-tier: in-domain / financial / off-topic)
+  → retrieveContextForQuery() (pgvector similarity search via search_documents() SQL fn)
+  → buildSystemPrompt() (mode: client|learner)
+  → OpenAI chat completion
+  → save to chat_messages + log to question_analytics
+```
 
-### Files Modified
+### Request Flow (Telegram)
 
-- `backend/src/services/retrieval.ts` — `classifyQueryDomain()`, `rewriteQueryForRetrieval()`, and `retrieveContextForQuery()` accept optional `conversationHistory`
-- `backend/src/routes/chat.ts` — three-tier handling, passes conversationHistory to classifier + retrieval
-- `backend/src/routes/telegram.ts` — same three-tier logic, fetches lightweight conversation history (last 2 rows from chat_messages where session_id IS NULL)
+```
+Telegram webhook → POST /api/telegram/webhook → verify secret
+  → same 3-tier classification + retrieval pipeline
+  → buildSystemPrompt() with same logic (always client mode)
+  → formatForTelegram() post-processes markdown → Telegram HTML
+```
 
-### Analytics Outcomes
+### Three-Tier Domain Classification
 
-- `'success'` — answered from documents
-- `'web_fallback'` — financial question answered from general knowledge
-- `'rejected'` — completely off-topic, scope message returned
+`classifyQueryDomain()` in `retrieval.ts` returns `{ in_domain, is_financial, reason }`:
+1. `in_domain=true` → retrieve from docs, answer with `[p.X]` citations
+2. `in_domain=false, is_financial=true` → skip retrieval, answer from LLM knowledge with `[Web]` label
+3. `in_domain=false, is_financial=false` → reject with scope message
 
-### Verification
+Both classifier and query rewriter accept optional `conversationHistory` (last 2 exchanges) to handle follow-up questions.
 
-- "What is a GIC?" → `[Web]` answer (financial, not in docs)
-- "Who won the Super Bowl?" → rejection message (off-topic)
-- Question in documents → normal doc answer with `[p.X]` citations
+### Prompt Builder (`backend/src/services/promptBuilder.ts`)
+
+Shared by both web and Telegram. Single `buildSystemPrompt(context, mode, usedWebFallback)` function. Modes:
+- **Client:** concise bullets, 1-2 sentences each, all facts included
+- **Learner:** expanded explanations (2-4 sentences per point) for junior advisors
+
+`formatForTelegram()` converts markdown to Telegram HTML (`<b>` tags, escaped entities).
+
+### Key Backend Files
+
+| File | Purpose |
+|------|---------|
+| `backend/src/index.ts` | Express app bootstrap, env validation, route mounting |
+| `backend/src/routes/chat.ts` | Web chat endpoints (message, sessions, history) |
+| `backend/src/routes/telegram.ts` | Telegram webhook handler + webhook registration |
+| `backend/src/routes/admin.ts` | Admin APIs (users, documents, analytics) |
+| `backend/src/routes/auth.ts` | Auth routes (login, profile) |
+| `backend/src/services/retrieval.ts` | Domain classification, query rewriting, pgvector RAG |
+| `backend/src/services/promptBuilder.ts` | Unified LLM system prompt + Telegram formatter |
+| `backend/src/services/ragConfig.ts` | RAG thresholds (env-configurable) |
+| `backend/src/services/documentProcessor.ts` | PDF parsing, chunking, embedding generation |
+| `backend/src/middleware/auth.ts` | JWT auth middleware (`authenticateUser`, `requireAdmin`) |
+| `backend/src/utils/analyticsLog.ts` | Fire-and-forget analytics logging |
+
+### Key Frontend Files
+
+| File | Purpose |
+|------|---------|
+| `frontend/app/chat/page.tsx` | Main chat UI with session sidebar |
+| `frontend/app/admin/dashboard/page.tsx` | Admin analytics dashboard |
+| `frontend/app/admin/users/page.tsx` | User management |
+| `frontend/app/admin/documents/page.tsx` | Document upload/management |
+| `frontend/app/login/page.tsx` | Login page |
+| `frontend/middleware.ts` | Supabase session refresh on every request |
+| `frontend/lib/supabase/` | Supabase client (client.ts), server (server.ts), middleware (middleware.ts) |
+
+### Database
+
+Schema reference: `docs/schema.sql`. Migrations are applied via Supabase MCP (`apply_migration`), not local migration files.
+
+Key tables: `profiles`, `documents`, `document_chunks` (with vector embeddings), `chat_sessions`, `chat_messages`, `question_analytics`, `telegram_link_tokens`, `audit_logs`.
+
+The `search_documents()` SQL function performs vector similarity search — note it returns `document_chunks.content` aliased as `text`.
+
+The `question_analytics` table uses `timestamp` (not `created_at`) as its time column. Outcome values stored in `metadata->>'outcome'`: `'success'`, `'web_fallback'`, `'rejected'`.
+
+### RAG Configuration (`ragConfig.ts`)
+
+All thresholds are env-configurable with sensible defaults:
+- `matchThreshold: 0.38` — minimum cosine similarity for vector search
+- `minSourceSimilarity: 0.45` — minimum to include as a source citation
+- `matchCount: 6` — max vector matches to return
+- `maxContextChunks: 14`, `maxContextChars: 18000` — context window limits
+
+### Auth Pattern
+
+Backend uses `authenticateUser` middleware that verifies Supabase JWT, then fetches role from `profiles` table. Admin routes chain `authenticateUser` + `requireAdmin`. The `AuthenticatedRequest` type extends Express `Request` with `user: { id, email, role }`.
+
+### Environment Variables
+
+**Required (backend):** `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `JWT_SECRET`
+
+**Optional (Telegram):** `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `WEBHOOK_URL`
+
+**Other:** `PORT` (default 3001), `CORS_ORIGIN` (default http://localhost:3000), `FRONTEND_URL`, `NODE_ENV`
+
+**Frontend:** `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_API_URL`
+
+## Implementation Plan
+
+There is a 6-task implementation plan being executed sequentially with UAT between tasks:
+
+1. ~~Loosen domain filter + `[Web]` label~~ — DONE
+2. Multi-chat sessions + memory — **NEXT**
+3. ~~Learner/Client mode per chat~~ — DONE
+4. ~~Unified prompts cleanup~~ — DONE
+5. Analytics: unanswered questions + top query types
+6. Email-based user invitation with self-service password
+
+See the detailed task specifications below for each remaining task.
 
 ---
 
@@ -71,26 +161,7 @@ Both `classifyQueryDomain()` and `rewriteQueryForRetrieval()` accept optional `c
 
 ### Database Migration (via Supabase MCP)
 
-```sql
--- New table: chat_sessions
-CREATE TABLE public.chat_sessions (
-  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
-  name TEXT NOT NULL DEFAULT 'New Chat',
-  mode TEXT NOT NULL DEFAULT 'client' CHECK (mode IN ('client', 'learner')),
-  created_at TIMESTAMPTZ DEFAULT now(),
-  updated_at TIMESTAMPTZ DEFAULT now()
-);
-
--- Add session_id to chat_messages
-ALTER TABLE public.chat_messages
-ADD COLUMN session_id UUID REFERENCES public.chat_sessions(id) ON DELETE CASCADE;
-
--- RLS for chat_sessions
-ALTER TABLE public.chat_sessions ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Users manage own sessions" ON public.chat_sessions
-  FOR ALL USING (auth.uid() = user_id);
-```
+The `chat_sessions` table and `session_id` column on `chat_messages` already exist in the schema (see `docs/schema.sql`).
 
 ### Backend Routes to Add (`backend/src/routes/chat.ts`)
 
@@ -132,94 +203,6 @@ CREATE POLICY "Users manage own sessions" ON public.chat_sessions
 
 ---
 
-## Task 3: Learner vs Client Mode
-
-**Goal:** Mode is set per chat session. Client mode = concise bullet points. Learner mode = same bullet points but with expanded explanations drawn from document content.
-
-### Prompt Logic (`backend/src/services/promptBuilder.ts`) — NEW FILE
-
-Extract all system prompt construction into a shared service. Both web (`chat.ts`) and Telegram (`telegram.ts`) will import from here.
-
-```typescript
-export type ChatMode = "client" | "learner";
-export type OutputFormat = "markdown" | "plaintext";
-
-export function buildSystemPrompt(
-  context: string,
-  mode: ChatMode,
-  format: OutputFormat,
-  usedWebFallback: boolean,
-): string;
-```
-
-**Client mode prompt additions:**
-
-- _"Present ALL relevant information from the documents as bullet points. Keep each point to 1-2 sentences. Do not skip or omit information — include every relevant fact, but state it briefly."_
-
-**Learner mode prompt additions:**
-
-- _"For each bullet point, provide an expanded explanation (2–4 sentences) drawing from the document context. Explain the reasoning, implications, or background so a junior advisor can fully understand."_
-
-**Format differences:**
-
-- `markdown`: use `**bold**`, `- bullets`, headers (web app)
-- `plaintext`: use `*` for bullets, no markdown syntax (Telegram)
-
-### Files to Modify
-
-- `backend/src/routes/chat.ts` — replace inline system prompt with `buildSystemPrompt(context, session.mode, 'markdown', usedWebFallback)`
-- `backend/src/routes/telegram.ts` — replace inline system prompt with `buildSystemPrompt(context, 'client', 'plaintext', usedWebFallback)` (Telegram always client mode for now)
-
-### Frontend
-
-- Display mode badge in chat header ("Client Mode" / "Learner Mode")
-- Mode is locked per session (set at creation) — no mid-chat switching
-
-### Verification
-
-- Create two chats: one client, one learner
-- Ask same question in both → client gets concise bullets, learner gets expanded explanations
-- Telegram always behaves like client mode
-
----
-
-## Task 4: Unified Prompts (Code Consistency)
-
-> **Clarification confirmed:** The **same base system prompt** (including mode instructions) is sent to the LLM for both web and Telegram. The difference is purely in **output post-processing**:
->
-> - Web app: response rendered as markdown (bold, bullet lists, headers)
-> - Telegram: response stripped of markdown, reformatted as plain text with `*` bullets
->
-> A single change to `promptBuilder.ts` affects both platforms simultaneously.
-
-### Architecture
-
-```
-buildSystemPrompt(context, mode, usedWebFallback) → string  ← SAME for both platforms
-         ↓
-    OpenAI LLM call (same)
-         ↓
-   formatForWeb(answer)        OR        formatForTelegram(answer)
-   (markdown rendering)               (strip markdown, plain text)
-```
-
-### `backend/src/services/promptBuilder.ts` (NEW)
-
-- `buildSystemPrompt(context, mode, usedWebFallback)` — produces the LLM system prompt
-- `formatForTelegram(answer)` — strips markdown, converts to plain text for Telegram
-
-### Files to Modify
-
-- `backend/src/routes/chat.ts` — use `buildSystemPrompt()`, keep markdown response as-is
-- `backend/src/routes/telegram.ts` — use same `buildSystemPrompt()`, apply `formatForTelegram()` to response
-
-### Verification
-
-- Same question in web and Telegram → same information, different formatting
-- Changing prompt in `promptBuilder.ts` immediately affects both platforms
-
----
-
 ## Task 5: Analytics — Unanswered Questions + Top Query Types
 
 **Goal:** Admin dashboard shows (a) monthly count of unanswered/web-fallback questions, and (b) top question categories.
@@ -242,10 +225,6 @@ buildSystemPrompt(context, mode, usedWebFallback) → string  ← SAME for both 
 - Alternative (no LLM cost): simple keyword bucketing by common financial advisory terms
 - Return: `[{category: 'Compliance', count: 45}, ...]`
 
-**Existing endpoint update:**
-
-- `GET /api/admin/analytics/monthly` — already exists, no change needed
-
 ### Frontend Changes (`frontend/app/admin/dashboard/page.tsx`)
 
 Add two new sections below existing stats:
@@ -262,7 +241,6 @@ Add two new sections below existing stats:
 
 - Ask several questions that don't match documents → check admin dashboard shows them in unanswered count
 - Ask financial questions → check top query categories populate
-
 - Verify monthly breakdown is accurate
 
 ---
@@ -274,11 +252,9 @@ Add two new sections below existing stats:
 ### Database Migration
 
 ```sql
--- Track invitation status on profiles
 ALTER TABLE public.profiles
 ADD COLUMN invitation_status TEXT DEFAULT 'pending' CHECK (invitation_status IN ('pending', 'accepted'));
 
--- invitation_sent_at for display in admin
 ALTER TABLE public.profiles
 ADD COLUMN invitation_sent_at TIMESTAMPTZ;
 ```
@@ -287,87 +263,19 @@ ADD COLUMN invitation_sent_at TIMESTAMPTZ;
 
 **`POST /api/admin/users/create` — Replace magic link flow:**
 
-Replace current `generateLink({ type: 'magiclink' })` with:
+Replace current `generateLink({ type: 'magiclink' })` with `supabase.auth.admin.inviteUserByEmail()`.
 
-```typescript
-// Use Supabase invite — sends email directly to user
-const { data, error } = await supabase.auth.admin.inviteUserByEmail(email, {
-  data: { role }, // passed to profile trigger
-  redirectTo: `${process.env.FRONTEND_URL}/set-password`,
-});
-```
-
-- `inviteUserByEmail()` sends the email automatically via Supabase Auth
-- User receives an email with a link to set their password
-- No more magic link shown to admin (cleaner flow)
-
-**Add `PATCH /api/admin/users/:id/resend-invite` endpoint:**
-
-- Calls `inviteUserByEmail` again for users with `invitation_status: 'pending'`
+**Add `PATCH /api/admin/users/:id/resend-invite` endpoint.**
 
 ### Frontend Changes
 
-**New page: `frontend/app/set-password/page.tsx`**
+**New page: `frontend/app/set-password/page.tsx`** — handles redirect from Supabase invite email, shows password setup form.
 
-- Handles redirect from Supabase invite email
-- Supabase passes `access_token` in URL hash
-- Page shows "Set your password" form (password + confirm password)
-- Calls `supabase.auth.updateUser({ password })`
-- On success → redirect to `/login` with success message
-- On success → backend updates `profiles.invitation_status = 'accepted'` via webhook or direct call
-
-**Admin Users Page (`frontend/app/admin/users/page.tsx`):**
-
-- Add "Invitation Status" column: `Pending` (orange) / `Active` (green)
-- Add "Resend Invite" button for pending users
-- Remove the "magic link" display section (no longer needed)
-- Show "Invitation sent to [email]" confirmation toast after user creation
-
-### Email Template (Supabase Dashboard)
-
-- Configure in Supabase Auth → Email Templates → "Invite user"
-- Customize with brand name "Advisors Clique"
-- Template variables: `{{ .ConfirmationURL }}` for the set-password link
-
-### Environment Variables
-
-- Ensure `FRONTEND_URL` is set in `backend/.env` (already referenced in `telegram.ts`)
+**Admin Users Page (`frontend/app/admin/users/page.tsx`):** — add invitation status column, resend invite button, remove magic link display.
 
 ### Verification
 
-- Admin creates user → user receives email within ~30 seconds
-- User clicks email link → lands on `/set-password` page
-- User sets password → can log in at `/login`
-- Admin dashboard shows user as "Active" after password is set
+- Admin creates user → user receives email
+- User clicks link → sets password → can log in
+- Admin dashboard shows "Active" after password is set
 - Resend invite works for pending users
-
----
-
-## Execution Order
-
-| #   | Task                                 | Complexity | UAT Required |
-| --- | ------------------------------------ | ---------- | ------------ |
-| 1   | Loosen domain filter + `[Web]` label | Low        | Yes          |
-| 2   | Multi-chat sessions + memory         | High       | Yes          |
-| 3   | Learner/Client mode per chat         | Medium     | Yes          |
-| 4   | Unified prompts cleanup              | Low        | Yes          |
-| 5   | Analytics dashboard enhancements     | Medium     | Yes          |
-| 6   | Email invitation flow                | Medium     | Yes          |
-
----
-
-## Critical Files Reference
-
-| File                                    | Purpose                                        |
-| --------------------------------------- | ---------------------------------------------- |
-| `backend/src/services/retrieval.ts`     | Domain classification, RAG retrieval           |
-| `backend/src/routes/chat.ts`            | Web chat endpoint + prompt assembly            |
-| `backend/src/routes/telegram.ts`        | Telegram bot handler                           |
-| `backend/src/routes/admin.ts`           | Admin APIs (users, documents, analytics)       |
-| `backend/src/services/promptBuilder.ts` | NEW — shared prompt building                   |
-| `backend/src/utils/analyticsLog.ts`     | Fire-and-forget analytics logging              |
-| `frontend/app/chat/page.tsx`            | Chat UI (will need session sidebar)            |
-| `frontend/app/admin/dashboard/page.tsx` | Analytics display                              |
-| `frontend/app/admin/users/page.tsx`     | User management UI                             |
-| `frontend/app/set-password/page.tsx`    | NEW — password setup from invite email         |
-| `docs/schema.sql`                       | Reference schema (migrations via Supabase MCP) |
