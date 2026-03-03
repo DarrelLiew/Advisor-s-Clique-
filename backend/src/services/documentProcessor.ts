@@ -3,6 +3,7 @@ import OpenAI from 'openai';
 // @ts-ignore - pdf-parse doesn't have types
 import pdfParse from 'pdf-parse';
 import { ragConfig } from './ragConfig';
+import { processPageTables, pdfToImages } from './tableProcessor';
 
 interface DocumentChunk {
   document_id: string;
@@ -287,11 +288,22 @@ export async function processDocument(documentId: string, filePath: string): Pro
     const pages = await extractTextFromPDF(fileBuffer);
     console.log(`Extracted ${pages.length} pages`);
 
+    // Step 3: Convert PDF pages to images (for vision-based table extraction)
+    console.log('Rendering PDF pages to images for table detection...');
+    let pageImages: Array<string | null>;
+    try {
+      pageImages = await pdfToImages(fileBuffer);
+      console.log(`Rendered ${pageImages.filter(Boolean).length}/${pageImages.length} pages to images`);
+    } catch (err: any) {
+      console.warn(`[TABLE] pdfToImages failed, proceeding without vision: ${err.message}`);
+      pageImages = new Array(pages.length).fill(null);
+    }
+
     // Free up memory
     fileBuffer.fill(0);
 
-    // Step 3: Process pages incrementally to avoid memory issues
-    console.log('Processing pages in batches...');
+    // Step 4: Process pages with table-aware chunking
+    console.log('Processing pages in batches (table-aware)...');
     let totalChunks = 0;
     let currentBatch: DocumentChunk[] = [];
     let chunkIndex = 0;
@@ -299,26 +311,49 @@ export async function processDocument(documentId: string, filePath: string): Pro
 
     for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
       const page = pages[pageIdx];
+      const pageImage = pageImages[pageIdx] || null;
       console.log(`Processing page ${pageIdx + 1}/${pages.length}...`);
 
-      // Generate chunks for this page
-      for (const chunk of chunkPage(page, documentId, chunkIndex)) {
+      // Separate tables from prose via hybrid pipeline
+      const { nonTableText, tableChunks } = await processPageTables(
+        openai,
+        page,
+        pageImage,
+      );
+
+      // Chunk the non-table prose text normally
+      for (const chunk of chunkPage({ ...page, text: nonTableText }, documentId, chunkIndex)) {
         currentBatch.push(chunk);
         chunkIndex = chunk.chunk_index + 1;
 
-        // When batch is full, process and clear
         if (currentBatch.length >= BATCH_SIZE) {
           await processBatch(currentBatch, ++batchCount);
           totalChunks += currentBatch.length;
-          currentBatch = []; // Clear for garbage collection
-
-          // Rate limiting: wait between batches
+          currentBatch = [];
           await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
         }
       }
 
-      // Clear page text from memory after processing
+      // Add enriched table chunks as atomic units
+      for (const tc of tableChunks) {
+        currentBatch.push({
+          document_id: documentId,
+          page_number: tc.pageNumber,
+          chunk_index: chunkIndex++,
+          text: tc.text,
+        });
+
+        if (currentBatch.length >= BATCH_SIZE) {
+          await processBatch(currentBatch, ++batchCount);
+          totalChunks += currentBatch.length;
+          currentBatch = [];
+          await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
+        }
+      }
+
+      // Clear page text and image from memory after processing
       pages[pageIdx].text = '';
+      pageImages[pageIdx] = null;
     }
 
     // Process any remaining chunks

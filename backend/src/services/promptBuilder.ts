@@ -41,14 +41,15 @@ Key instructions:
   - Use bullet points with sub-bullets for grouped data.
   - NEVER use markdown tables. Instead, use a hierarchical bullet structure with bold labels.
   - NEVER use <b>, <i>, <u>, or any HTML tags for formatting. Use only markdown syntax (e.g., **bold**).
+  Use 8 spaces of indentation for each sub-level of bullets.
   Example of CORRECT hierarchical format for tabular data:
   **Welcome Bonus by Plan Type**
   - **Choice 5**
-    - S$1,200 to S$2,399.99: Not Applicable
-    - S$6,000 to S$11,999.99: 15%
+          - S$1,200 to S$2,399.99: Not Applicable
+          - S$6,000 to S$11,999.99: 15%
   - **Choice 10**
-    - S$1,200 to S$2,399.99: Not Applicable
-    - S$2,400 to S$3,599.99: 5%
+          - S$1,200 to S$2,399.99: Not Applicable
+          - S$2,400 to S$3,599.99: 5%
 - CRITICAL CITATION RULE: You MUST place a page citation [p.X] at the END of EVERY bullet point or sentence. NEVER group citations at the end of your response. Each bullet must end with its own citation.
   Example of CORRECT citation placement:
   - A premium holiday allows policyholders to stop paying premiums after the first premium. [p.19]

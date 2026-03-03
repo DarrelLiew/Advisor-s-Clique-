@@ -142,14 +142,16 @@ CREATE TABLE IF NOT EXISTS public.document_chunks (
   chunk_index INTEGER NOT NULL,
   content TEXT NOT NULL,  -- NOTE: column is 'content', not 'text'. SQL functions alias it as 'text' in their return types.
   embedding vector(1536),  -- OpenAI text-embedding-3-small dimension
+  fts tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,  -- Full-text search (auto-generated)
   metadata JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON public.document_chunks(document_id);
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON public.document_chunks 
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON public.document_chunks
   USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS idx_chunks_fts ON public.document_chunks USING gin(fts);
 
 -- RLS Policies
 ALTER TABLE public.document_chunks ENABLE ROW LEVEL SECURITY;
@@ -405,6 +407,74 @@ BEGIN
     AND (filter_document_ids IS NULL OR dc.document_id = ANY(filter_document_ids))
     AND 1 - (dc.embedding <=> query_embedding) > match_threshold
   ORDER BY dc.embedding <=> query_embedding
+  LIMIT match_count;
+END;
+$$;
+
+-- Hybrid search function: combines vector similarity + full-text search using Reciprocal Rank Fusion (RRF)
+-- Used by retrieval.ts as the primary search method; falls back to search_documents() on error.
+CREATE OR REPLACE FUNCTION search_documents_hybrid(
+  query_embedding vector(1536),
+  query_text text,
+  match_threshold float DEFAULT 0.38,
+  match_count int DEFAULT 6,
+  filter_document_ids uuid[] DEFAULT NULL
+)
+RETURNS TABLE (
+  id uuid,
+  document_id uuid,
+  filename text,
+  text text,
+  page_number int,
+  similarity float,
+  metadata jsonb
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  k constant int := 60;  -- RRF constant
+BEGIN
+  RETURN QUERY
+  WITH vector_results AS (
+    SELECT
+      dc.id, dc.document_id, d.filename, dc.content AS text, dc.page_number,
+      (1 - (dc.embedding <=> query_embedding)) AS similarity, dc.metadata,
+      ROW_NUMBER() OVER (ORDER BY dc.embedding <=> query_embedding) AS vector_rank
+    FROM document_chunks dc
+    JOIN documents d ON d.id = dc.document_id
+    WHERE d.deleted_at IS NULL AND d.processing_status = 'ready'
+      AND (filter_document_ids IS NULL OR dc.document_id = ANY(filter_document_ids))
+      AND (1 - (dc.embedding <=> query_embedding)) > match_threshold
+    ORDER BY dc.embedding <=> query_embedding
+    LIMIT match_count * 3
+  ),
+  fts_results AS (
+    SELECT
+      dc.id, dc.document_id, d.filename, dc.content AS text, dc.page_number,
+      ts_rank(dc.fts, plainto_tsquery('english', query_text)) AS fts_score, dc.metadata,
+      ROW_NUMBER() OVER (ORDER BY ts_rank(dc.fts, plainto_tsquery('english', query_text)) DESC) AS fts_rank
+    FROM document_chunks dc
+    JOIN documents d ON d.id = dc.document_id
+    WHERE d.deleted_at IS NULL AND d.processing_status = 'ready'
+      AND (filter_document_ids IS NULL OR dc.document_id = ANY(filter_document_ids))
+      AND dc.fts @@ plainto_tsquery('english', query_text)
+    ORDER BY fts_score DESC
+    LIMIT match_count * 3
+  ),
+  combined AS (
+    SELECT
+      COALESCE(v.id, f.id) AS id, COALESCE(v.document_id, f.document_id) AS document_id,
+      COALESCE(v.filename, f.filename) AS filename, COALESCE(v.text, f.text) AS text,
+      COALESCE(v.page_number, f.page_number) AS page_number,
+      COALESCE(v.similarity, 0::float) AS similarity, COALESCE(v.metadata, f.metadata) AS metadata,
+      COALESCE(1.0 / (k + v.vector_rank), 0) + COALESCE(1.0 / (k + f.fts_rank), 0) AS rrf_score
+    FROM vector_results v
+    FULL OUTER JOIN fts_results f ON v.id = f.id
+  )
+  SELECT combined.id, combined.document_id, combined.filename, combined.text,
+    combined.page_number, combined.similarity, combined.metadata
+  FROM combined
+  ORDER BY combined.rrf_score DESC
   LIMIT match_count;
 END;
 $$;

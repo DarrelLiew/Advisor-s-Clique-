@@ -18,6 +18,8 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET!;
 const MAX_MESSAGE_LENGTH = 4000;
+const PARAGRAPH_TIMEOUT_MS = 1200; // Max time between streaming edits (fallback if no paragraph break)
+const MIN_EDIT_CHARS = 60;          // Minimum new characters before editing message
 const NO_DIRECT_DOC_ANSWER_REGEX = /(does not explicitly|not explicitly|not specified|cannot be determined from the document|document does not (?:state|specify|provide))/i;
 const LOW_RELEVANCE_NOTE = 'The documents do not explicitly provide a direct answer; this is the closest guidance from related sections.';
 
@@ -82,6 +84,71 @@ async function sendLongMessage(
 
   await sendMessage(chatId, text.slice(0, cutAt), undefined, parseMode);
   await sendLongMessage(chatId, text.slice(cutAt).trimStart(), replyMarkup, parseMode);
+}
+
+async function sendChatAction(chatId: number, action: string = 'typing'): Promise<void> {
+  try {
+    await axios.post(`${TELEGRAM_API}/sendChatAction`, { chat_id: chatId, action });
+  } catch {
+    // Non-critical — silently ignore
+  }
+}
+
+async function sendMessageAndGetId(
+  chatId: number,
+  text: string,
+  parseMode?: 'HTML'
+): Promise<number | null> {
+  const payload: Record<string, unknown> = { chat_id: chatId, text };
+  if (parseMode) payload.parse_mode = parseMode;
+  try {
+    const resp = await axios.post(`${TELEGRAM_API}/sendMessage`, payload);
+    return resp.data?.result?.message_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function editMessageText(
+  chatId: number,
+  messageId: number,
+  text: string,
+  replyMarkup?: object,
+  parseMode?: 'HTML'
+): Promise<void> {
+  const payload: Record<string, unknown> = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+  };
+  if (parseMode) payload.parse_mode = parseMode;
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  try {
+    await axios.post(`${TELEGRAM_API}/editMessageText`, payload);
+  } catch (err: any) {
+    // "message is not modified" is expected when content hasn't changed — ignore
+    if (err?.response?.status === 400 && err?.response?.data?.description?.includes('message is not modified')) {
+      return;
+    }
+    // If HTML parse fails during edit, retry as plain text
+    if (parseMode && err?.response?.status === 400) {
+      console.warn(`[TELEGRAM] HTML edit failed, retrying as plain text`);
+      const plainPayload: Record<string, unknown> = {
+        chat_id: chatId,
+        message_id: messageId,
+        text: text.replace(/<\/?b>/g, ''),
+      };
+      if (replyMarkup) plainPayload.reply_markup = replyMarkup;
+      try {
+        await axios.post(`${TELEGRAM_API}/editMessageText`, plainPayload);
+      } catch {
+        // Silently fail — best-effort
+      }
+      return;
+    }
+    // Other errors: log but don't throw (best-effort streaming)
+    console.warn(`[TELEGRAM] editMessageText error: ${err?.response?.data?.description || err.message}`);
+  }
 }
 
 // Extract page numbers from inline citations.
@@ -263,6 +330,13 @@ async function handleQuery(
   const startTime = Date.now();
   const timings: Record<string, number> = {};
 
+  // Send placeholder immediately so user sees feedback right away
+  const placeholderMsgId = await sendMessageAndGetId(chatId, '...');
+
+  // Send typing indicator and re-send every 4s during retrieval phase
+  await sendChatAction(chatId, 'typing');
+  const typingInterval = setInterval(() => sendChatAction(chatId, 'typing'), 4000);
+
   // Fetch last 2 messages for lightweight conversation context (2 exchanges)
   const { data: historyRows } = await supabase
     .from('chat_messages')
@@ -280,40 +354,54 @@ async function handleQuery(
     }
   }
 
-  // 1. Classify domain — three-tier: in-docs / financial-general / off-topic
-  const classifyStart = Date.now();
-  const domain = await classifyQueryDomain(openai, queryText, conversationHistory);
-  timings.classification_ms = elapsedMs(classifyStart);
+  // 1. Classify domain + retrieve context in parallel for speed
+  const pipelineStart = Date.now();
+  const [domainResult, retrievalResult] = await Promise.all([
+    classifyQueryDomain(openai, queryText, conversationHistory),
+    retrieveContextForQuery({ openai, queryText, logLabel: 'telegram', conversationHistory, skipRerank: true }),
+  ]);
+  const domain = domainResult;
+  timings.classification_ms = elapsedMs(pipelineStart);
   let usedWebFallback = false;
   let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
 
   if (!domain.in_domain && !domain.is_financial) {
-    // Completely off-topic — reject
-    await sendMessage(chatId, "I'm here to help with financial advisory topics. That question falls outside the scope of this assistant.");
+    clearInterval(typingInterval);
+    const rejectMsg = "I'm here to help with financial advisory topics. That question falls outside the scope of this assistant.";
+    if (placeholderMsgId) {
+      await editMessageText(chatId, placeholderMsgId, rejectMsg);
+    } else {
+      await sendMessage(chatId, rejectMsg);
+    }
     logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'domain_gate_reject', reason: domain.reason } });
     return;
   }
 
-  // Always attempt retrieval for any financial query — let vector search decide
-  const retrievalStart = Date.now();
-  retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'telegram', conversationHistory });
-  timings.retrieval_ms = elapsedMs(retrievalStart);
+  // Use retrieval result from parallel call
+  retrieval = retrievalResult;
+  timings.retrieval_ms = elapsedMs(pipelineStart);
   if (!retrieval.context) {
     usedWebFallback = true;
   }
 
+  // Show progress: update placeholder now that retrieval is done
+  if (placeholderMsgId) {
+    await editMessageText(chatId, placeholderMsgId, 'Generating response...');
+  }
+
   // 2. Build system prompt using unified builder (same as web app, only formatting differs)
-  // Telegram always uses client mode (concise) and plaintext format
-  const promptBuildStart = Date.now();
   const systemPrompt = buildSystemPrompt(
     retrieval?.context || '',
-    'client', // Telegram always uses client mode (concise)
+    'client',
     usedWebFallback,
   );
-  timings.prompt_build_ms = elapsedMs(promptBuildStart);
 
+  // Stop typing interval — we're about to stream
+  clearInterval(typingInterval);
+
+  // 3. Stream LLM response with progressive message editing
   const llmStart = Date.now();
-  const completion = await openai.chat.completions.create({
+  const stream = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages: [
       { role: 'system', content: systemPrompt },
@@ -322,10 +410,48 @@ async function handleQuery(
     ],
     temperature: 0,
     max_tokens: ragConfig.generationMaxTokensClient,
+    stream: true,
   });
+
+  let streamedAnswer = '';
+  let lastEditTime = 0;
+  let lastEditLength = 0;
+  let pendingEdit: Promise<void> | null = null;
+
+  for await (const chunk of stream) {
+    const delta = chunk.choices[0]?.delta?.content;
+    if (!delta) continue;
+    streamedAnswer += delta;
+
+    // Paragraph-buffered editing: edit when a paragraph break is detected or timeout
+    const now = Date.now();
+    const newChars = streamedAnswer.length - lastEditLength;
+    const timeSinceEdit = now - lastEditTime;
+    const hasParagraphBreak = streamedAnswer.slice(lastEditLength).includes('\n\n');
+
+    const shouldEdit = placeholderMsgId && newChars >= MIN_EDIT_CHARS && (
+      hasParagraphBreak || timeSinceEdit >= PARAGRAPH_TIMEOUT_MS
+    );
+
+    if (shouldEdit) {
+      lastEditTime = now;
+      lastEditLength = streamedAnswer.length;
+      const preview = streamedAnswer.length > MAX_MESSAGE_LENGTH
+        ? streamedAnswer.slice(0, MAX_MESSAGE_LENGTH - 3) + '...'
+        : streamedAnswer;
+      // Wait for previous edit to finish (prevent overlapping edits), then fire next
+      const prevEdit = pendingEdit;
+      pendingEdit = (async () => {
+        if (prevEdit) await prevEdit;
+        await editMessageText(chatId, placeholderMsgId, formatForTelegram(preview), undefined, 'HTML');
+      })();
+    }
+  }
+  // Wait for any in-flight edit to complete before final edit
+  if (pendingEdit) await pendingEdit;
   timings.llm_ms = elapsedMs(llmStart);
 
-  let answer = completion.choices[0].message.content ?? 'No response generated.';
+  let answer = streamedAnswer || 'No response generated.';
   // Sanitize: strip HTML tags from LLM output before formatting for Telegram
   answer = stripHtmlTags(answer);
   const maxVectorSimilarity = retrieval ? getMaxVectorSimilarity(retrieval.chunks) : 0;
@@ -336,10 +462,10 @@ async function handleQuery(
   const noDirectAnswer = isNoDirectAnswerInDocs(answer);
   const responseTime = Date.now() - startTime;
 
-  // 3. Format answer for Telegram (shared formatter — same structure as web, HTML markup)
+  // 4. Format final answer for Telegram
   const telegramFormattedAnswer = formatForTelegram(answer);
 
-  // 4. Build inline keyboard buttons (only for document-sourced answers)
+  // 5. Build inline keyboard buttons (only for document-sourced answers)
   let replyMarkup: object | undefined;
 
   if (!usedWebFallback && retrieval) {
@@ -372,8 +498,24 @@ async function handleQuery(
     replyMarkup = inline_keyboard.length > 0 ? { inline_keyboard } : undefined;
   }
 
+  // 6. Final edit with formatted answer + buttons, or send as new message if too long
   console.log(`[TELEGRAM][format] raw_answer_preview="${answer.substring(0, 200)}" formatted_preview="${telegramFormattedAnswer.substring(0, 200)}"`);
-  await sendLongMessage(chatId, telegramFormattedAnswer, replyMarkup, 'HTML');
+
+  if (placeholderMsgId && telegramFormattedAnswer.length <= MAX_MESSAGE_LENGTH) {
+    // Edit the streamed message with final formatted version + buttons
+    await editMessageText(chatId, placeholderMsgId, telegramFormattedAnswer, replyMarkup, 'HTML');
+  } else if (placeholderMsgId) {
+    // Answer too long for single message — delete placeholder and use sendLongMessage
+    try {
+      await axios.post(`${TELEGRAM_API}/deleteMessage`, { chat_id: chatId, message_id: placeholderMsgId });
+    } catch {
+      // Best-effort delete
+    }
+    await sendLongMessage(chatId, telegramFormattedAnswer, replyMarkup, 'HTML');
+  } else {
+    // Placeholder failed — fall back to normal send
+    await sendLongMessage(chatId, telegramFormattedAnswer, replyMarkup, 'HTML');
+  }
 
   const saveStart = Date.now();
   await supabase.from('chat_messages').insert({

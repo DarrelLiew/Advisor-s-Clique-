@@ -307,6 +307,65 @@ export async function classifyQueryDomain(
   }
 }
 
+async function rerankChunks(
+  openai: OpenAI,
+  queryText: string,
+  chunks: RetrievedChunk[],
+): Promise<RetrievedChunk[]> {
+  if (chunks.length <= 3) return chunks; // Not worth reranking small sets
+
+  try {
+    // Truncate chunk text to keep the reranking call fast and cheap
+    const chunkPreviews = chunks.map((c, i) =>
+      `[${i + 1}] ${c.text.slice(0, 300)}`
+    ).join('\n');
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a relevance scorer. Rate each chunk\'s relevance to the query on a scale of 0-10. ' +
+            'Return ONLY a JSON array of integer scores, one per chunk, in the same order. ' +
+            'Example: [8, 3, 9, 1, 6]',
+        },
+        {
+          role: 'user',
+          content: `Query: "${queryText}"\n\nChunks:\n${chunkPreviews}`,
+        },
+      ],
+      temperature: 0,
+      max_tokens: 80,
+    });
+
+    const raw = completion.choices[0].message.content?.trim();
+    if (!raw) return chunks;
+
+    // Parse the scores array — handle markdown code fences
+    const cleaned = raw.replace(/^```json?\s*/i, '').replace(/\s*```$/i, '');
+    const scores: number[] = JSON.parse(cleaned);
+
+    if (!Array.isArray(scores) || scores.length !== chunks.length) {
+      console.warn(`[RERANK] score count mismatch: got ${scores.length}, expected ${chunks.length}`);
+      return chunks;
+    }
+
+    // Pair chunks with rerank scores and sort descending
+    const paired = chunks.map((chunk, i) => ({
+      chunk,
+      rerankScore: typeof scores[i] === 'number' ? scores[i] : 0,
+    }));
+    paired.sort((a, b) => b.rerankScore - a.rerankScore);
+
+    console.log(`[RERANK] scores=${scores.join(',')} reordered=${paired.map(p => p.rerankScore).join(',')}`);
+    return paired.map(p => p.chunk);
+  } catch (err: any) {
+    console.warn(`[RERANK] failed, using original order: ${err.message}`);
+    return chunks; // Fallback to original similarity ordering
+  }
+}
+
 function toContext(chunks: RetrievedChunk[]): string {
   const selected: RetrievedChunk[] = [];
   let totalChars = 0;
@@ -363,8 +422,9 @@ export async function retrieveContextForQuery(params: {
   queryText: string;
   logLabel: string;
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
+  skipRerank?: boolean;
 }) {
-  const { openai, queryText, logLabel, conversationHistory } = params;
+  const { openai, queryText, logLabel, conversationHistory, skipRerank } = params;
   const rewrittenQuery = await rewriteQueryForRetrieval(openai, queryText, conversationHistory);
 
   // Option C: Check embedding cache first
@@ -385,14 +445,33 @@ export async function retrieveContextForQuery(params: {
     console.log(`[EMBED][${logLabel}] cache_miss=true embed_ms=${embedMs} query="${rewrittenQuery.substring(0, 60)}..."`);
   }
 
-  const { data, error } = await supabase.rpc('search_documents', {
+  // Hybrid search: vector similarity + full-text search with RRF fusion
+  let data: any[] | null = null;
+  let error: any = null;
+
+  const hybridResult = await supabase.rpc('search_documents_hybrid', {
     query_embedding: queryEmbedding,
+    query_text: rewrittenQuery,
     match_threshold: ragConfig.matchThreshold,
     match_count: ragConfig.matchCount,
     filter_document_ids: null,
   });
+  data = hybridResult.data;
+  error = hybridResult.error;
 
-  if (error) throw error;
+  // Fallback to pure vector search if hybrid fails
+  if (error) {
+    console.warn(`[RAG][${logLabel}] hybrid search failed, falling back to vector-only: ${error.message}`);
+    const vectorResult = await supabase.rpc('search_documents', {
+      query_embedding: queryEmbedding,
+      match_threshold: ragConfig.matchThreshold,
+      match_count: ragConfig.matchCount,
+      filter_document_ids: null,
+    });
+    data = vectorResult.data;
+    error = vectorResult.error;
+    if (error) throw error;
+  }
 
   const chunks: RetrievedChunk[] = (data || []).map((chunk: any) => ({
     document_id: chunk.document_id,
@@ -437,17 +516,23 @@ export async function retrieveContextForQuery(params: {
     }
   }
 
+  // Rerank chunks using gpt-4o-mini for better relevance ordering (skippable for latency-sensitive callers)
+  const rerankStart = Date.now();
+  const rerankedChunks = skipRerank ? chunks : await rerankChunks(openai, rewrittenQuery, chunks);
+  const rerankMs = Date.now() - rerankStart;
+
   console.log(
-    `[RAG][${logLabel}] query="${queryText}" rewritten="${rewrittenQuery}" chunks=${chunks.length} ` +
-    `(${vectorMatchedChunks.length} vector, ${chunks.length - vectorMatchedChunks.length} page-expanded) ` +
-    `top=${chunks.slice(0, 5).map((c) => `${c.filename}:p${c.page_number}@${c.similarity.toFixed(3)}`).join(', ')}`
+    `[RAG][${logLabel}] query="${queryText}" rewritten="${rewrittenQuery}" chunks=${rerankedChunks.length} ` +
+    `(${vectorMatchedChunks.length} vector, ${rerankedChunks.length - vectorMatchedChunks.length} page-expanded) ` +
+    `rerank_ms=${rerankMs} ` +
+    `top=${rerankedChunks.slice(0, 5).map((c) => `${c.filename}:p${c.page_number}@${c.similarity.toFixed(3)}`).join(', ')}`
   );
 
   return {
     rewrittenQuery,
-    chunks,
-    context: toContext(chunks),
-    sources: buildSources(chunks),
+    chunks: rerankedChunks,
+    context: toContext(rerankedChunks),
+    sources: buildSources(chunks), // Use original chunks for sources (they have similarity scores)
   };
 }
 

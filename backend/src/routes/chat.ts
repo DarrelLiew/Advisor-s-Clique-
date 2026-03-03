@@ -65,13 +65,13 @@ function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
 }
 
 function resolveSourcesForCitations(
-  chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string }>,
+  chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string; text?: string }>,
   citedPages: number[],
-): Array<{ filename: string; page: number; similarity: number; document_id: string }> {
+): ChatSource[] {
   if (citedPages.length === 0) return [];
 
-  const bestByPage = new Map<number, { filename: string; page: number; similarity: number; document_id: string }>();
-  let topChunk: { filename: string; page_number: number; similarity: number; document_id: string } | null = null;
+  const bestByPage = new Map<number, ChatSource>();
+  let topChunk: (typeof chunks)[number] | null = null;
 
   for (const chunk of chunks) {
     if (!topChunk || chunk.similarity > topChunk.similarity) {
@@ -85,11 +85,12 @@ function resolveSourcesForCitations(
         page: chunk.page_number,
         similarity: chunk.similarity,
         document_id: chunk.document_id,
+        text: chunk.text,
       });
     }
   }
 
-  const resolved: Array<{ filename: string; page: number; similarity: number; document_id: string }> = [];
+  const resolved: ChatSource[] = [];
   const seen = new Set<string>();
 
   for (const page of citedPages) {
@@ -100,6 +101,7 @@ function resolveSourcesForCitations(
         page,
         similarity: topChunk.similarity,
         document_id: topChunk.document_id,
+        text: topChunk.text,
       }
       : null);
     if (!source) continue;
@@ -162,7 +164,7 @@ function formatAnswer(answer: string): string {
   return formatted;
 }
 
-type ChatSource = { filename: string; page: number; similarity: number; document_id: string };
+type ChatSource = { filename: string; page: number; similarity: number; document_id: string; text?: string };
 
 function finalizeChatAnswer(params: {
   answer: string;

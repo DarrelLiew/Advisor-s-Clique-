@@ -76,12 +76,13 @@ const PdfViewer = dynamic(() => import('./PdfViewer'), {
 interface Props {
   url: string;
   page: number;
+  highlightKey?: string;
 }
 
-export default function ViewDocumentClient({ url, page }: Props) {
+export default function ViewDocumentClient({ url, page, highlightKey }: Props) {
   return (
     <PdfErrorBoundary>
-      <PdfViewer url={url} initialPage={page} />
+      <PdfViewer url={url} initialPage={page} highlightKey={highlightKey} />
     </PdfErrorBoundary>
   );
 }

@@ -36,7 +36,7 @@ interface Message {
   id: string;
   query: string;
   response: string;
-  sources: Array<{ filename: string; page: number; similarity: number; document_id?: string }>;
+  sources: Array<{ filename: string; page: number; similarity: number; document_id?: string; text?: string }>;
   created_at: string;
 }
 
@@ -451,15 +451,21 @@ export default function ChatPage() {
   };
 
   // ---- document viewer ----
-  const openDocumentPage = async (source: { document_id?: string; page: number }) => {
+  const openDocumentPage = async (source: { document_id?: string; page: number; text?: string }) => {
     if (!source.document_id) return;
     try {
       const data = await api.get<{ url: string }>(
         `/api/chat/document-url/${source.document_id}`
       );
       if (data.url) {
+        // Store chunk text in localStorage so the viewer can display it as a highlight
+        const highlightKey = `doc-highlight-${Date.now()}`;
+        if (source.text) {
+          localStorage.setItem(highlightKey, source.text);
+        }
+        const highlightParam = source.text ? `&highlight=${encodeURIComponent(highlightKey)}` : "";
         window.open(
-          `/view-document?url=${encodeURIComponent(data.url)}&page=${source.page}`,
+          `/view-document?url=${encodeURIComponent(data.url)}&page=${source.page}${highlightParam}`,
           "_blank",
           "noopener,noreferrer"
         );
@@ -649,11 +655,14 @@ export default function ChatPage() {
                               if (href?.startsWith("cite:")) {
                                 const [docId, pageStr] = href.slice(5).split(":");
                                 const page = parseInt(pageStr, 10);
+                                const matchedSource = message.sources.find(
+                                  (s) => s.document_id === docId && s.page === page
+                                );
                                 return (
                                   <button
                                     onClick={(e) => {
                                       e.preventDefault();
-                                      openDocumentPage({ document_id: docId, page });
+                                      openDocumentPage({ document_id: docId, page, text: matchedSource?.text });
                                     }}
                                     className="inline-flex items-center gap-0.5 bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5 text-xs text-blue-600 hover:bg-blue-100 font-medium mx-0.5 align-middle not-prose"
                                   >
