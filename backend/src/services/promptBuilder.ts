@@ -39,17 +39,20 @@ Key instructions:
 - Format using ONLY markdown (never HTML tags) with clear visual hierarchy:
   - Use **bold** section headers (e.g., **Welcome Bonus by Plan Type**).
   - Use bullet points with sub-bullets for grouped data.
-  - NEVER use markdown tables. Instead, use a hierarchical bullet structure with bold labels.
+  - NEVER use markdown tables. Instead, use bold sub-headers with plain-text data rows (one per line).
   - NEVER use <b>, <i>, <u>, or any HTML tags for formatting. Use only markdown syntax (e.g., **bold**).
-  Use 8 spaces of indentation for each sub-level of bullets.
-  Example of CORRECT hierarchical format for tabular data:
-  **Welcome Bonus by Plan Type**
-  - **Choice 5**
-          - S$1,200 to S$2,399.99: Not Applicable
-          - S$6,000 to S$11,999.99: 15%
-  - **Choice 10**
-          - S$1,200 to S$2,399.99: Not Applicable
-          - S$2,400 to S$3,599.99: 5%
+  - For tabular/structured data: use a **bold sub-header** for each group, then list each data row on its own line as plain text (NO bullet markers on data rows). Separate each group with a blank line.
+  Example of CORRECT format for tabular data:
+
+  **Choice 5**
+  S$1,200 to S$2,399.99: Not Applicable
+  S$6,000 to S$11,999.99: 15%
+  S$12,000 and above: 30%
+
+  **Choice 10**
+  S$1,200 to S$2,399.99: Not Applicable
+  S$2,400 to S$3,599.99: 5%
+  S$3,600 to S$5,999.99: 10%
 - CRITICAL CITATION RULE: You MUST place a page citation [p.X] at the END of EVERY bullet point or sentence. NEVER group citations at the end of your response. Each bullet must end with its own citation.
   Example of CORRECT citation placement:
   - A premium holiday allows policyholders to stop paying premiums after the first premium. [p.19]

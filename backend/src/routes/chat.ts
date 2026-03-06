@@ -161,6 +161,10 @@ function formatAnswer(answer: string): string {
     '$1\n\n'
   );
 
+  // Ensure blank line before bullet lists when preceded by a non-bullet line.
+  // CommonMark requires a blank line between a paragraph and a list start.
+  formatted = formatted.replace(/^(?!\s*[-*]\s)(.+)\n(\s*[-*]\s)/gm, '$1\n\n$2');
+
   return formatted;
 }
 

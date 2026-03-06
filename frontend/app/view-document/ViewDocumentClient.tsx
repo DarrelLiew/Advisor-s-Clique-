@@ -47,6 +47,9 @@ class PdfErrorBoundary extends Component<
           <p style={{ fontSize: 14, color: '#6c757d', margin: 0 }}>
             Please try refreshing the page or opening the document in a new tab.
           </p>
+          <p style={{ fontSize: 12, color: '#adb5bd', margin: 0, maxWidth: 500, wordBreak: 'break-word' }}>
+            {this.state.error?.message}
+          </p>
         </div>
       );
     }
@@ -77,12 +80,13 @@ interface Props {
   url: string;
   page: number;
   highlightKey?: string;
+  highlightText?: string;
 }
 
-export default function ViewDocumentClient({ url, page, highlightKey }: Props) {
+export default function ViewDocumentClient({ url, page, highlightKey, highlightText }: Props) {
   return (
     <PdfErrorBoundary>
-      <PdfViewer url={url} initialPage={page} highlightKey={highlightKey} />
+      <PdfViewer url={url} initialPage={page} highlightKey={highlightKey} highlightText={highlightText} />
     </PdfErrorBoundary>
   );
 }

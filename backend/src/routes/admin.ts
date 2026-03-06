@@ -354,10 +354,10 @@ async function resolveAnalyticsDiagnostics(): Promise<{
 router.use(authenticateUser);
 router.use(requireAdmin);
 
-// Create user account
+// Create user account — sends Supabase invite email directly
 router.post('/users/create', async (req: AuthenticatedRequest, res) => {
   try {
-    const { email, role = 'user', send_magic_link = true } = req.body;
+    const { email, role = 'user' } = req.body;
 
     if (!email || typeof email !== 'string') {
       return res.status(400).json({ error: 'Email is required' });
@@ -373,50 +373,108 @@ router.post('/users/create', async (req: AuthenticatedRequest, res) => {
       return res.status(400).json({ error: 'Role must be "user" or "admin"' });
     }
 
-    // Create user via Supabase Admin API
-    const { data: authUser, error: authError } = await supabase.auth.admin.createUser({
-      email: email.trim(),
-      email_confirm: true, // Skip email confirmation
-      user_metadata: { role },
-    });
+    // Invite user via Supabase — sends an email with a link to set password
+    const { data: inviteData, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
+      email.trim(),
+      {
+        data: { role },
+        redirectTo: `${process.env.FRONTEND_URL || process.env.CORS_ORIGIN || 'http://localhost:3000'}/set-password`,
+      },
+    );
 
-    if (authError) throw authError;
+    if (inviteError) throw inviteError;
 
-    // Profile is auto-created via trigger
-
-    // Generate magic link if requested
-    let magicLink = null;
-    if (send_magic_link) {
-      const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
-        type: 'magiclink',
-        email: email.trim(),
-      });
-
-      if (!linkError && linkData) {
-        magicLink = linkData.properties.action_link;
-      }
-    }
+    // Update profile with invitation metadata (profile auto-created by trigger)
+    // Small delay to let the trigger fire
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await supabase
+      .from('profiles')
+      .update({
+        role,
+        invitation_status: 'pending',
+        invitation_sent_at: new Date().toISOString(),
+      })
+      .eq('id', inviteData.user.id);
 
     await createAuditLog({
       userId: req.user!.id,
-      action: 'user_created',
+      action: 'user_invited',
       resourceType: 'user',
-      resourceId: authUser.user.id,
+      resourceId: inviteData.user.id,
       metadata: { email: email.trim(), role },
     });
 
     res.json({
       success: true,
       user: {
-        id: authUser.user.id,
+        id: inviteData.user.id,
         email: email.trim(),
         role,
       },
-      magic_link: magicLink,
+      message: 'Invitation email sent successfully.',
     });
   } catch (error: any) {
     console.error('Create user error:', error);
     res.status(500).json({ error: error.message || 'Failed to create user' });
+  }
+});
+
+// Resend invitation email
+router.patch('/users/:id/resend-invite', async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+
+    // Look up user email
+    const { data: userData, error: userError } = await supabase.auth.admin.getUserById(id);
+    if (userError || !userData?.user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const email = userData.user.email;
+    if (!email) {
+      return res.status(400).json({ error: 'User has no email address' });
+    }
+
+    // Check invitation status
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('invitation_status')
+      .eq('id', id)
+      .single();
+
+    if (profile?.invitation_status === 'accepted') {
+      return res.status(400).json({ error: 'User has already accepted the invitation' });
+    }
+
+    // Re-invite the user
+    const { error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
+      email,
+      {
+        data: userData.user.user_metadata,
+        redirectTo: `${process.env.FRONTEND_URL || process.env.CORS_ORIGIN || 'http://localhost:3000'}/set-password`,
+      },
+    );
+
+    if (inviteError) throw inviteError;
+
+    // Update invitation_sent_at
+    await supabase
+      .from('profiles')
+      .update({ invitation_sent_at: new Date().toISOString() })
+      .eq('id', id);
+
+    await createAuditLog({
+      userId: req.user!.id,
+      action: 'invitation_resent',
+      resourceType: 'user',
+      resourceId: id,
+      metadata: { email },
+    });
+
+    res.json({ success: true, message: 'Invitation email resent successfully.' });
+  } catch (error: any) {
+    console.error('Resend invite error:', error);
+    res.status(500).json({ error: error.message || 'Failed to resend invitation' });
   }
 });
 
@@ -430,24 +488,35 @@ router.get('/users', async (req: AuthenticatedRequest, res) => {
         role,
         telegram_id,
         created_at,
-        metadata
+        metadata,
+        invitation_status,
+        invitation_sent_at
       `)
       .order('created_at', { ascending: false });
 
     if (error) throw error;
 
-    // Get emails from auth.users (requires service role)
+    // Get emails and last_sign_in from auth.users (requires service role)
     const { data: authUsers, error: authError } = await supabase.auth.admin.listUsers();
 
     if (authError) throw authError;
 
     const usersMap = new Map(authUsers.users.map(u => [u.id, u]));
 
-    const users = data.map(profile => ({
-      ...profile,
-      email: usersMap.get(profile.id)?.email,
-      telegram_linked: !!profile.telegram_id,
-    }));
+    const users = data.map(profile => {
+      const authUser = usersMap.get(profile.id);
+      // If the user has signed in, they've accepted the invitation
+      const hasSignedIn = !!authUser?.last_sign_in_at;
+      const effectiveStatus = hasSignedIn ? 'accepted' : (profile.invitation_status || 'pending');
+
+      return {
+        ...profile,
+        email: authUser?.email,
+        telegram_linked: !!profile.telegram_id,
+        invitation_status: effectiveStatus,
+        last_sign_in_at: authUser?.last_sign_in_at || null,
+      };
+    });
 
     res.json({ users });
   } catch (error: any) {

@@ -3,11 +3,12 @@ import ViewDocumentClient from './ViewDocumentClient';
 export default function ViewDocumentPage({
   searchParams,
 }: {
-  searchParams: { url?: string; page?: string; highlight?: string };
+  searchParams: { url?: string; page?: string; highlight?: string; text?: string };
 }) {
   const rawUrl = searchParams.url;
   const page = parseInt(searchParams.page ?? '1', 10) || 1;
   const highlightKey = searchParams.highlight ?? '';
+  const highlightText = searchParams.text ?? '';
 
   if (!rawUrl) {
     return (
@@ -67,7 +68,7 @@ export default function ViewDocumentPage({
           Open in new tab ↗
         </a>
       </div>
-      <ViewDocumentClient url={decodedUrl} page={page} highlightKey={highlightKey} />
+      <ViewDocumentClient url={decodedUrl} page={page} highlightKey={highlightKey} highlightText={highlightText} />
     </div>
   );
 }

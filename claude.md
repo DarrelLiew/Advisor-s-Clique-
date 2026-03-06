@@ -64,6 +64,7 @@ Telegram webhook → POST /api/telegram/webhook → verify secret
 ### Three-Tier Domain Classification
 
 `classifyQueryDomain()` in `retrieval.ts` returns `{ in_domain, is_financial, reason }`:
+
 1. `in_domain=true` → retrieve from docs, answer with `[p.X]` citations
 2. `in_domain=false, is_financial=true` → skip retrieval, answer from LLM knowledge with `[Web]` label
 3. `in_domain=false, is_financial=false` → reject with scope message
@@ -73,6 +74,7 @@ Both classifier and query rewriter accept optional `conversationHistory` (last 2
 ### Prompt Builder (`backend/src/services/promptBuilder.ts`)
 
 Shared by both web and Telegram. Single `buildSystemPrompt(context, mode, usedWebFallback)` function. Modes:
+
 - **Client:** concise bullets, 1-2 sentences each, all facts included
 - **Learner:** expanded explanations (2-4 sentences per point) for junior advisors
 
@@ -80,31 +82,31 @@ Shared by both web and Telegram. Single `buildSystemPrompt(context, mode, usedWe
 
 ### Key Backend Files
 
-| File | Purpose |
-|------|---------|
-| `backend/src/index.ts` | Express app bootstrap, env validation, route mounting |
-| `backend/src/routes/chat.ts` | Web chat endpoints (message, sessions, history) |
-| `backend/src/routes/telegram.ts` | Telegram webhook handler + webhook registration |
-| `backend/src/routes/admin.ts` | Admin APIs (users, documents, analytics) |
-| `backend/src/routes/auth.ts` | Auth routes (login, profile) |
-| `backend/src/services/retrieval.ts` | Domain classification, query rewriting, pgvector RAG |
-| `backend/src/services/promptBuilder.ts` | Unified LLM system prompt + Telegram formatter |
-| `backend/src/services/ragConfig.ts` | RAG thresholds (env-configurable) |
-| `backend/src/services/documentProcessor.ts` | PDF parsing, chunking, embedding generation |
-| `backend/src/middleware/auth.ts` | JWT auth middleware (`authenticateUser`, `requireAdmin`) |
-| `backend/src/utils/analyticsLog.ts` | Fire-and-forget analytics logging |
+| File                                        | Purpose                                                  |
+| ------------------------------------------- | -------------------------------------------------------- |
+| `backend/src/index.ts`                      | Express app bootstrap, env validation, route mounting    |
+| `backend/src/routes/chat.ts`                | Web chat endpoints (message, sessions, history)          |
+| `backend/src/routes/telegram.ts`            | Telegram webhook handler + webhook registration          |
+| `backend/src/routes/admin.ts`               | Admin APIs (users, documents, analytics)                 |
+| `backend/src/routes/auth.ts`                | Auth routes (login, profile)                             |
+| `backend/src/services/retrieval.ts`         | Domain classification, query rewriting, pgvector RAG     |
+| `backend/src/services/promptBuilder.ts`     | Unified LLM system prompt + Telegram formatter           |
+| `backend/src/services/ragConfig.ts`         | RAG thresholds (env-configurable)                        |
+| `backend/src/services/documentProcessor.ts` | PDF parsing, chunking, embedding generation              |
+| `backend/src/middleware/auth.ts`            | JWT auth middleware (`authenticateUser`, `requireAdmin`) |
+| `backend/src/utils/analyticsLog.ts`         | Fire-and-forget analytics logging                        |
 
 ### Key Frontend Files
 
-| File | Purpose |
-|------|---------|
-| `frontend/app/chat/page.tsx` | Main chat UI with session sidebar |
-| `frontend/app/admin/dashboard/page.tsx` | Admin analytics dashboard |
-| `frontend/app/admin/users/page.tsx` | User management |
-| `frontend/app/admin/documents/page.tsx` | Document upload/management |
-| `frontend/app/login/page.tsx` | Login page |
-| `frontend/middleware.ts` | Supabase session refresh on every request |
-| `frontend/lib/supabase/` | Supabase client (client.ts), server (server.ts), middleware (middleware.ts) |
+| File                                    | Purpose                                                                     |
+| --------------------------------------- | --------------------------------------------------------------------------- |
+| `frontend/app/chat/page.tsx`            | Main chat UI with session sidebar                                           |
+| `frontend/app/admin/dashboard/page.tsx` | Admin analytics dashboard                                                   |
+| `frontend/app/admin/users/page.tsx`     | User management                                                             |
+| `frontend/app/admin/documents/page.tsx` | Document upload/management                                                  |
+| `frontend/app/login/page.tsx`           | Login page                                                                  |
+| `frontend/middleware.ts`                | Supabase session refresh on every request                                   |
+| `frontend/lib/supabase/`                | Supabase client (client.ts), server (server.ts), middleware (middleware.ts) |
 
 ### Database
 
@@ -119,6 +121,7 @@ The `question_analytics` table uses `timestamp` (not `created_at`) as its time c
 ### RAG Configuration (`ragConfig.ts`)
 
 All thresholds are env-configurable with sensible defaults:
+
 - `matchThreshold: 0.38` — minimum cosine similarity for vector search
 - `minSourceSimilarity: 0.45` — minimum to include as a source citation
 - `matchCount: 6` — max vector matches to return
@@ -143,11 +146,11 @@ Backend uses `authenticateUser` middleware that verifies Supabase JWT, then fetc
 There is a 6-task implementation plan being executed sequentially with UAT between tasks:
 
 1. ~~Loosen domain filter + `[Web]` label~~ — DONE
-2. Multi-chat sessions + memory — **NEXT**
+2. ~~Multi-chat sessions + memory~~ — DONE
 3. ~~Learner/Client mode per chat~~ — DONE
 4. ~~Unified prompts cleanup~~ — DONE
-5. Analytics: unanswered questions + top query types
-6. Email-based user invitation with self-service password
+5. ~~Analytics: unanswered questions + top query types~~ — DONE
+6. ~~Email-based user invitation with self-service password~~ — DONE
 
 See the detailed task specifications below for each remaining task.
 

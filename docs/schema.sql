@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS public.profiles (
   id UUID REFERENCES auth.users(id) ON DELETE CASCADE PRIMARY KEY,
   role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
   telegram_id BIGINT UNIQUE,
+  invitation_status TEXT DEFAULT 'pending' CHECK (invitation_status IN ('pending', 'accepted')),
+  invitation_sent_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   metadata JSONB DEFAULT '{}'::jsonb
 );

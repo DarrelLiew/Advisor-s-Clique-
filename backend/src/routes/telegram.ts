@@ -192,13 +192,13 @@ function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
 }
 
 function resolveSourcesForCitations(
-  chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string }>,
+  chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string; text: string }>,
   citedPages: number[],
-): Array<{ filename: string; page: number; document_id: string }> {
+): Array<{ filename: string; page: number; document_id: string; text: string }> {
   if (citedPages.length === 0) return [];
 
-  const bestByPage = new Map<number, { filename: string; page: number; similarity: number; document_id: string }>();
-  let topChunk: { filename: string; page_number: number; similarity: number; document_id: string } | null = null;
+  const bestByPage = new Map<number, { filename: string; page: number; similarity: number; document_id: string; text: string }>();
+  let topChunk: { filename: string; page_number: number; similarity: number; document_id: string; text: string } | null = null;
 
   for (const chunk of chunks) {
     if (!topChunk || chunk.similarity > topChunk.similarity) {
@@ -212,11 +212,12 @@ function resolveSourcesForCitations(
         page: chunk.page_number,
         similarity: chunk.similarity,
         document_id: chunk.document_id,
+        text: chunk.text,
       });
     }
   }
 
-  const resolved: Array<{ filename: string; page: number; document_id: string }> = [];
+  const resolved: Array<{ filename: string; page: number; document_id: string; text: string }> = [];
   const seen = new Set<string>();
 
   for (const page of citedPages) {
@@ -227,6 +228,7 @@ function resolveSourcesForCitations(
         page,
         similarity: topChunk.similarity,
         document_id: topChunk.document_id,
+        text: topChunk.text,
       }
       : null);
     if (!source) continue;
@@ -238,6 +240,7 @@ function resolveSourcesForCitations(
       filename: source.filename,
       page: source.page,
       document_id: source.document_id,
+      text: source.text,
     });
   }
 
@@ -484,8 +487,9 @@ async function handleQuery(
         : source.filename.replace(/\.[^.]+$/, '');
 
       const frontendUrl = process.env.FRONTEND_URL;
+      const highlightText = source.text ? encodeURIComponent(source.text.slice(0, 500)) : '';
       const buttonUrl = frontendUrl && frontendUrl.startsWith('https://')
-        ? `${frontendUrl}/view-document?url=${encodeURIComponent(signedUrl)}&page=${source.page}`
+        ? `${frontendUrl}/view-document?url=${encodeURIComponent(signedUrl)}&page=${source.page}${highlightText ? `&text=${highlightText}` : ''}`
         : `${signedUrl}#page=${source.page}`;
 
       buttons.push({ text: `${label} p.${source.page}`, url: buttonUrl });
