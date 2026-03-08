@@ -116,7 +116,7 @@ export default function UsersPage() {
   return (
     <div className='max-w-5xl mx-auto px-6 py-8'>
       <div className='mb-6'>
-        <h2 className='text-2xl font-bold mb-2'>User Management</h2>
+        <h2 className='text-2xl font-bold font-heading mb-2'>User Management</h2>
         <p className='text-gray-600'>
           Invite new users and manage existing accounts
         </p>
@@ -196,8 +196,8 @@ export default function UsersPage() {
           </button>
         </form>
 
-        <div className='mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200'>
-          <p className='text-sm text-blue-800'>
+        <div className='mt-4 p-3 bg-gold/5 rounded-lg border border-gold/20'>
+          <p className='text-sm text-gold-dark'>
             An invitation email will be sent directly to the user. They will
             click the link to set their password and access the app.
           </p>
@@ -261,7 +261,7 @@ export default function UsersPage() {
                       <span
                         className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
                           user.role === "admin"
-                            ? "bg-purple-100 text-purple-700"
+                            ? "bg-gold/10 text-gold-dark"
                             : "bg-gray-100 text-gray-600"
                         }`}
                       >
@@ -292,7 +292,7 @@ export default function UsersPage() {
                         <button
                           onClick={() => handleResendInvite(user.id)}
                           disabled={resendingId === user.id}
-                          className='inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded px-2.5 py-1 transition-colors disabled:opacity-50'
+                          className='inline-flex items-center gap-1 text-xs text-gold-dark hover:text-gold bg-gold/5 hover:bg-gold/10 border border-gold/20 rounded px-2.5 py-1 transition-colors disabled:opacity-50'
                         >
                           {resendingId === user.id ? (
                             <Loader2 className='w-3 h-3 animate-spin' />

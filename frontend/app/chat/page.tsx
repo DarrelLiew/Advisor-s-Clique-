@@ -7,7 +7,7 @@ import {
   FileText,
   Loader2,
   LogOut,
-  LayoutDashboard,
+  ArrowLeft,
   ExternalLink,
   Plus,
   Trash2,
@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import Image from "next/image";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import { api, SessionExpiredError } from "@/lib/api";
 
@@ -157,40 +158,43 @@ function NewSessionModal({
   const [name, setName] = useState("");
   const [mode, setMode] = useState<"client" | "learner">("client");
   const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleCreate = async () => {
     setCreating(true);
+    setError(null);
     try {
       const session = await api.post<ChatSession>("/api/chat/sessions", {
         name: name.trim() || "New Chat",
         mode,
       });
       onCreate(session);
-    } catch (error: any) {
-      if (error instanceof SessionExpiredError) {
+    } catch (err: any) {
+      if (err instanceof SessionExpiredError) {
         onRedirect();
         return;
       }
-      console.error("Failed to create session:", error);
+      console.error("Failed to create session:", err);
+      setError(err.message || "Failed to create chat. Please try again.");
     } finally {
       setCreating(false);
     }
   };
 
   return (
-    <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/40'>
-      <div className='bg-white rounded-2xl shadow-xl w-full max-w-sm mx-4 p-6'>
-        <h2 className='text-lg font-semibold mb-4'>New Chat</h2>
+    <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/60'>
+      <div className='bg-[#1F1F1F] rounded-2xl shadow-xl w-full max-w-sm mx-4 p-6 border border-[#2B2B2B]'>
+        <h2 className='text-lg font-semibold font-heading text-white mb-4'>New Chat</h2>
 
         {/* Mode toggle */}
-        <p className='text-sm text-gray-500 mb-2'>Mode</p>
-        <div className='flex rounded-lg overflow-hidden border border-gray-200 mb-4'>
+        <p className='text-sm text-gray-400 mb-2'>Mode</p>
+        <div className='flex rounded-lg overflow-hidden border border-[#2B2B2B] mb-4'>
           <button
             onClick={() => setMode("client")}
             className={`flex-1 py-2 text-sm font-medium transition-colors ${
               mode === "client"
-                ? "bg-primary text-primary-foreground"
-                : "bg-white text-gray-600 hover:bg-gray-50"
+                ? "bg-gold-gradient text-black"
+                : "bg-[#141414] text-gray-400 hover:bg-[#2B2B2B]"
             }`}
           >
             Client
@@ -199,15 +203,15 @@ function NewSessionModal({
             onClick={() => setMode("learner")}
             className={`flex-1 py-2 text-sm font-medium transition-colors ${
               mode === "learner"
-                ? "bg-primary text-primary-foreground"
-                : "bg-white text-gray-600 hover:bg-gray-50"
+                ? "bg-gold-gradient text-black"
+                : "bg-[#141414] text-gray-400 hover:bg-[#2B2B2B]"
             }`}
           >
             Learner
           </button>
         </div>
 
-        <p className='text-xs text-gray-400 mb-4'>
+        <p className='text-xs text-gray-500 mb-4'>
           {mode === "client"
             ? "Concise bullet-point answers for quick reference."
             : "Expanded explanations with reasoning — ideal for learning."}
@@ -220,24 +224,28 @@ function NewSessionModal({
           onChange={(e) => setName(e.target.value)}
           placeholder='Chat name (optional)'
           maxLength={60}
-          className='w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary mb-4'
+          className='w-full px-3 py-2 bg-[#141414] border border-[#2B2B2B] rounded-lg text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-gold mb-4'
           onKeyDown={(e) => {
             if (e.key === "Enter") handleCreate();
           }}
           autoFocus
         />
 
+        {error && (
+          <p className='text-xs text-red-400 mb-3'>{error}</p>
+        )}
+
         <div className='flex gap-3'>
           <button
             onClick={onClose}
-            className='flex-1 py-2 rounded-lg border text-sm text-gray-600 hover:bg-gray-50'
+            className='flex-1 py-2 rounded-lg border border-[#2B2B2B] text-sm text-gray-400 hover:bg-[#2B2B2B] transition-colors'
           >
             Cancel
           </button>
           <button
             onClick={handleCreate}
             disabled={creating}
-            className='flex-1 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 flex items-center justify-center gap-2'
+            className='flex-1 py-2 rounded-lg bg-gold-gradient text-black text-sm font-semibold hover:shadow-gold-glow disabled:opacity-50 flex items-center justify-center gap-2 transition-shadow'
           >
             {creating ? <Loader2 className='w-4 h-4 animate-spin' /> : null}
             Create
@@ -536,16 +544,28 @@ export default function ChatPage() {
   // ============================================================================
 
   return (
-    <div className='flex h-screen bg-gray-50 overflow-hidden'>
+    <div className='flex h-screen bg-[#0F0F0F] overflow-hidden'>
       {/* ------------------------------------------------------------------ */}
       {/* Sidebar */}
       {/* ------------------------------------------------------------------ */}
-      <div className='w-64 shrink-0 bg-white border-r flex flex-col'>
+      <div className='w-64 shrink-0 bg-[#141414] border-r border-[#2B2B2B] flex flex-col'>
+        {/* Logo */}
+        <div className='px-4 pt-5 pb-4 flex justify-center'>
+          <Image
+            src='/AC_LogoName_Gold_Primary.png'
+            alt='Advisors Clique Collective'
+            width={180}
+            height={50}
+            className='object-contain'
+            priority
+          />
+        </div>
+
         {/* Sidebar header */}
-        <div className='p-4 border-b'>
+        <div className='px-4 pb-4 border-b border-[#2B2B2B]'>
           <button
             onClick={() => setShowNewSessionModal(true)}
-            className='w-full flex items-center justify-center gap-2 bg-primary text-primary-foreground rounded-lg py-2 px-3 text-sm font-medium hover:bg-primary/90 transition-colors'
+            className='w-full flex items-center justify-center gap-2 bg-gold-gradient text-black rounded-lg py-2 px-3 text-sm font-semibold hover:shadow-gold-glow transition-shadow'
           >
             <Plus className='w-4 h-4' />
             New Chat
@@ -556,10 +576,10 @@ export default function ChatPage() {
         <div className='flex-1 overflow-y-auto py-2'>
           {loadingSessions ? (
             <div className='flex justify-center py-8'>
-              <Loader2 className='w-5 h-5 animate-spin text-gray-400' />
+              <Loader2 className='w-5 h-5 animate-spin text-gray-500' />
             </div>
           ) : sessions.length === 0 ? (
-            <p className='text-xs text-gray-400 text-center py-8 px-4'>
+            <p className='text-xs text-gray-500 text-center py-8 px-4'>
               No chats yet. Click "New Chat" to start.
             </p>
           ) : (
@@ -567,10 +587,10 @@ export default function ChatPage() {
               <div
                 key={session.id}
                 onClick={() => selectSession(session)}
-                className={`group relative flex items-start gap-2 px-3 py-2.5 mx-2 rounded-lg cursor-pointer transition-colors ${
+                className={`group relative flex items-start gap-2 px-3 py-2.5 mx-2 rounded-lg cursor-pointer transition-all ${
                   activeSession?.id === session.id
-                    ? "bg-primary/10 text-primary"
-                    : "hover:bg-gray-100 text-gray-700"
+                    ? "bg-[#1F1F1F] border-l-[3px] border-l-gold shadow-gold-glow text-white"
+                    : "border-l-[3px] border-l-transparent hover:bg-[#1F1F1F] text-gray-300"
                 }`}
               >
                 <MessageSquare className='w-4 h-4 mt-0.5 shrink-0 opacity-60' />
@@ -580,13 +600,13 @@ export default function ChatPage() {
                     <span
                       className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
                         session.mode === "learner"
-                          ? "bg-purple-100 text-purple-600"
-                          : "bg-gray-100 text-gray-500"
+                          ? "bg-gold/15 text-gold-light"
+                          : "bg-[#2B2B2B] text-gray-400"
                       }`}
                     >
                       {session.mode}
                     </span>
-                    <span className='text-xs text-gray-400'>
+                    <span className='text-xs text-gray-500'>
                       {formatRelativeTime(session.updated_at)}
                     </span>
                   </div>
@@ -598,7 +618,7 @@ export default function ChatPage() {
                     handleDeleteSession(session.id);
                   }}
                   disabled={deletingId === session.id}
-                  className='opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-50 hover:text-red-500 transition-all shrink-0'
+                  className='opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-900/30 hover:text-red-400 transition-all shrink-0'
                   title='Delete chat'
                 >
                   {deletingId === session.id ? (
@@ -613,10 +633,10 @@ export default function ChatPage() {
         </div>
 
         {/* Sidebar footer: logout */}
-        <div className='border-t p-3'>
+        <div className='border-t border-[#2B2B2B] p-3'>
           <button
             onClick={handleLogout}
-            className='w-full flex items-center gap-2 text-sm text-gray-500 hover:text-gray-800 px-2 py-1.5 rounded-lg hover:bg-gray-100 transition-colors'
+            className='w-full flex items-center gap-2 text-sm text-gray-400 hover:text-white px-2 py-1.5 rounded-lg hover:bg-[#1F1F1F] transition-colors'
           >
             <LogOut className='w-4 h-4' />
             Logout
@@ -629,17 +649,28 @@ export default function ChatPage() {
       {/* ------------------------------------------------------------------ */}
       <div className='flex-1 flex flex-col min-w-0'>
         {/* Header */}
-        <div className='bg-white border-b px-6 py-4 flex justify-between items-center shrink-0'>
+        <div className='bg-[#1F1F1F] text-white border-b border-[#2B2B2B] px-6 py-4 flex justify-between items-center shrink-0'>
+          <div className='flex items-center gap-4'>
+            {isAdmin && (
+              <Link
+                href='/admin/dashboard'
+                className='flex items-center gap-1.5 text-sm text-gray-400 hover:text-gold transition-colors'
+              >
+                <ArrowLeft className='w-4 h-4' />
+                Back to Dashboard
+              </Link>
+            )}
+          </div>
           <div className='flex items-center gap-3'>
-            <h1 className='text-xl font-semibold'>
+            <h1 className='text-lg font-semibold font-heading'>
               {activeSession ? activeSession.name : "AI Assistant"}
             </h1>
             {activeSession && (
               <span
                 className={`text-xs px-2 py-0.5 rounded-full font-medium ${
                   activeSession.mode === "learner"
-                    ? "bg-purple-100 text-purple-600"
-                    : "bg-gray-100 text-gray-500"
+                    ? "bg-gold/15 text-gold-light"
+                    : "bg-[#2B2B2B] text-gray-400"
                 }`}
               >
                 {activeSession.mode === "learner"
@@ -648,22 +679,13 @@ export default function ChatPage() {
               </span>
             )}
           </div>
-          {isAdmin && (
-            <Link
-              href='/admin/dashboard'
-              className='flex items-center gap-2 text-sm text-gray-600 hover:text-gray-900'
-            >
-              <LayoutDashboard className='w-4 h-4' />
-              Dashboard
-            </Link>
-          )}
         </div>
 
         {/* Messages */}
         <div className='flex-1 overflow-y-auto py-6'>
           <div className='max-w-3xl mx-auto px-6 space-y-6'>
             {!activeSession ? (
-              <div className='flex flex-col items-center justify-center py-24 text-gray-400'>
+              <div className='flex flex-col items-center justify-center py-24 text-gray-500'>
                 <MessageSquare className='w-16 h-16 mb-4' />
                 <p className='text-lg font-medium mb-1'>No chat selected</p>
                 <p className='text-sm'>
@@ -672,10 +694,10 @@ export default function ChatPage() {
               </div>
             ) : loadingHistory ? (
               <div className='flex justify-center items-center py-20'>
-                <Loader2 className='w-8 h-8 animate-spin text-gray-400' />
+                <Loader2 className='w-8 h-8 animate-spin text-gray-500' />
               </div>
             ) : messages.length === 0 ? (
-              <div className='flex flex-col items-center justify-center py-20 text-gray-400'>
+              <div className='flex flex-col items-center justify-center py-20 text-gray-500'>
                 <FileText className='w-16 h-16 mb-4' />
                 <p>Ask a question to start the conversation</p>
               </div>
@@ -684,15 +706,15 @@ export default function ChatPage() {
                 <div key={message.id} className='space-y-4'>
                   {/* User query */}
                   <div className='flex justify-end'>
-                    <div className='bg-primary text-primary-foreground rounded-2xl px-4 py-3 max-w-[75%] text-sm leading-relaxed'>
+                    <div className='bg-gold text-[#0A0A0A] rounded-2xl px-4 py-3 max-w-[75%] text-sm leading-relaxed font-medium'>
                       {message.query}
                     </div>
                   </div>
 
                   {/* Bot response */}
                   <div className='flex justify-start'>
-                    <div className='bg-white rounded-2xl px-5 py-4 max-w-[85%] shadow-sm text-sm text-gray-800'>
-                      <div className='prose prose-sm max-w-none prose-li:my-0.5 prose-headings:mb-2'>
+                    <div className='bg-[#1F1F1F] border border-[#2B2B2B] rounded-2xl px-5 py-4 max-w-[85%] text-sm text-gray-200'>
+                      <div className='prose prose-sm max-w-none prose-li:my-0.5 prose-headings:mb-2 prose-p:text-gray-200 prose-strong:text-white prose-li:text-gray-200 prose-headings:text-white prose-a:text-gold-light'>
                         <ReactMarkdown
                           urlTransform={(url) => {
                             if (
@@ -743,7 +765,7 @@ export default function ChatPage() {
                                         text: matchedSource?.text,
                                       });
                                     }}
-                                    className='inline-flex items-center gap-0.5 bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5 text-xs text-blue-600 hover:bg-blue-100 font-medium mx-0.5 align-middle not-prose'
+                                    className='inline-flex items-center gap-0.5 bg-gold/10 border border-gold/30 rounded px-1.5 py-0.5 text-xs text-gold-light hover:bg-gold/20 font-medium mx-0.5 align-middle not-prose transition-colors'
                                   >
                                     <FileText className='w-3 h-3' />
                                     {children}
@@ -752,7 +774,7 @@ export default function ChatPage() {
                               }
                               if (href?.startsWith("cite-nolink:")) {
                                 return (
-                                  <span className='inline-flex items-center gap-0.5 bg-gray-100 border border-gray-200 rounded px-1.5 py-0.5 text-xs text-gray-500 font-medium mx-0.5 align-middle not-prose'>
+                                  <span className='inline-flex items-center gap-0.5 bg-[#2B2B2B] border border-[#3a3a3a] rounded px-1.5 py-0.5 text-xs text-gray-400 font-medium mx-0.5 align-middle not-prose'>
                                     <FileText className='w-3 h-3' />
                                     {children}
                                   </span>
@@ -778,8 +800,8 @@ export default function ChatPage() {
 
                       {/* Sources */}
                       {message.sources && message.sources.length > 0 && (
-                        <div className='mt-4 pt-3 border-t border-gray-100'>
-                          <p className='text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2'>
+                        <div className='mt-4 pt-3 border-t border-[#2B2B2B]'>
+                          <p className='text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2'>
                             Sources
                           </p>
                           <div className='flex flex-wrap gap-2'>
@@ -788,17 +810,17 @@ export default function ChatPage() {
                                 key={idx}
                                 onClick={() => openDocumentPage(source)}
                                 disabled={!source.document_id}
-                                className='inline-flex items-center gap-1.5 bg-gray-50 border border-gray-200 rounded-md px-2.5 py-1 text-xs text-gray-600 hover:bg-gray-100 hover:border-gray-300 disabled:cursor-default disabled:hover:bg-gray-50 disabled:hover:border-gray-200 transition-colors'
+                                className='inline-flex items-center gap-1.5 bg-[#2B2B2B] border border-[#3a3a3a] rounded-md px-2.5 py-1 text-xs text-gray-300 hover:bg-[#333] hover:border-gold/30 disabled:cursor-default disabled:hover:bg-[#2B2B2B] disabled:hover:border-[#3a3a3a] transition-colors'
                               >
-                                <FileText className='w-3 h-3 shrink-0 text-gray-400' />
+                                <FileText className='w-3 h-3 shrink-0 text-gray-500' />
                                 <span className='font-medium'>
                                   {source.filename}
                                 </span>
-                                <span className='text-gray-400'>
+                                <span className='text-gray-500'>
                                   · p.{source.page}
                                 </span>
                                 {source.document_id && (
-                                  <ExternalLink className='w-3 h-3 shrink-0 text-gray-400' />
+                                  <ExternalLink className='w-3 h-3 shrink-0 text-gray-500' />
                                 )}
                               </button>
                             ))}
@@ -813,8 +835,8 @@ export default function ChatPage() {
 
             {loading && (
               <div className='flex justify-start'>
-                <div className='bg-white rounded-2xl px-5 py-4 shadow-sm'>
-                  <Loader2 className='w-5 h-5 animate-spin text-gray-400' />
+                <div className='bg-[#1F1F1F] border border-[#2B2B2B] rounded-2xl px-5 py-4'>
+                  <Loader2 className='w-5 h-5 animate-spin text-gold' />
                 </div>
               </div>
             )}
@@ -824,7 +846,7 @@ export default function ChatPage() {
         </div>
 
         {/* Input */}
-        <div className='bg-white border-t p-4 shrink-0'>
+        <div className='bg-[#141414] border-t border-[#2B2B2B] p-4 shrink-0'>
           <form onSubmit={sendMessage} className='max-w-3xl mx-auto flex gap-3'>
             <input
               type='text'
@@ -836,12 +858,12 @@ export default function ChatPage() {
                   : "Select or create a chat to begin"
               }
               disabled={loading || !activeSession}
-              className='flex-1 px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50'
+              className='flex-1 px-4 py-2.5 bg-[#1F1F1F] border border-[#2B2B2B] text-white placeholder-gray-500 rounded-lg focus:outline-none focus:ring-2 focus:ring-gold focus:border-gold disabled:opacity-50'
             />
             <button
               type='submit'
               disabled={loading || !input.trim() || !activeSession}
-              className='bg-primary text-primary-foreground px-6 py-2 rounded-lg hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2'
+              className='bg-gold-gradient text-black px-6 py-2.5 rounded-lg hover:shadow-gold-glow disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 font-semibold transition-shadow'
             >
               <Send className='w-4 h-4' />
               Send

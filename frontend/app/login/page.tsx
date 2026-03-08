@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
+import Image from "next/image";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -44,70 +45,82 @@ export default function LoginPage() {
   };
 
   return (
-    <div className='min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8'>
-      <div className='max-w-md w-full space-y-8'>
-        <div>
-          <h2 className='mt-6 text-center text-3xl font-extrabold text-gray-900'>
-            Sign in to your account
-          </h2>
-          <p className='mt-2 text-center text-sm text-gray-600'>
-            Advisors Clique AI Assistant
-          </p>
+    <div className='min-h-screen flex items-center justify-center bg-[#0A0A0A] py-12 px-4 sm:px-6 lg:px-8'>
+      <div className='max-w-md w-full'>
+        <div className='bg-white rounded-2xl shadow-xl p-8 space-y-8'>
+          {/* Logo */}
+          <div className='flex flex-col items-center'>
+            <Image
+              src='/AC_LogoName_Gold_Primary.png'
+              alt='Advisors Clique Collective'
+              width={200}
+              height={56}
+              className='mb-6 object-contain'
+              priority
+            />
+            <h2 className='text-center text-2xl font-semibold font-heading text-foreground'>
+              Sign in to your account
+            </h2>
+            <p className='mt-2 text-center text-sm text-muted-foreground'>
+              Advisors Clique AI Assistant
+            </p>
+          </div>
+
+          <form className='space-y-6' onSubmit={handleSubmit}>
+            <div className='space-y-4'>
+              <div>
+                <label htmlFor='email-address' className='sr-only'>
+                  Email address
+                </label>
+                <input
+                  id='email-address'
+                  name='email'
+                  type='email'
+                  autoComplete='email'
+                  required
+                  className='appearance-none relative block w-full px-3 py-2.5 border border-border placeholder-muted-foreground text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-gold focus:border-gold sm:text-sm'
+                  placeholder='Email address'
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  disabled={loading}
+                />
+              </div>
+              <div>
+                <label htmlFor='password' className='sr-only'>
+                  Password
+                </label>
+                <input
+                  id='password'
+                  name='password'
+                  type='password'
+                  autoComplete='current-password'
+                  required
+                  className='appearance-none relative block w-full px-3 py-2.5 border border-border placeholder-muted-foreground text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-gold focus:border-gold sm:text-sm'
+                  placeholder='Password'
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={loading}
+                />
+              </div>
+            </div>
+
+            {error && (
+              <div className='rounded-lg bg-red-50 p-4'>
+                <div className='text-sm text-red-800'>{error}</div>
+              </div>
+            )}
+
+            <div>
+              <button
+                type='submit'
+                disabled={loading}
+                className='group relative w-full flex justify-center py-2.5 px-4 border border-transparent text-sm font-semibold rounded-lg text-black bg-gold-gradient hover:shadow-gold-glow focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gold disabled:opacity-50 disabled:cursor-not-allowed transition-shadow'
+              >
+                {loading ? "Signing in..." : "Sign in"}
+              </button>
+            </div>
+          </form>
         </div>
-        <form className='mt-8 space-y-6' onSubmit={handleSubmit}>
-          <div className='rounded-md shadow-sm -space-y-px'>
-            <div>
-              <label htmlFor='email-address' className='sr-only'>
-                Email address
-              </label>
-              <input
-                id='email-address'
-                name='email'
-                type='email'
-                autoComplete='email'
-                required
-                className='appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-t-md focus:outline-none focus:ring-primary focus:border-primary focus:z-10 sm:text-sm'
-                placeholder='Email address'
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                disabled={loading}
-              />
-            </div>
-            <div>
-              <label htmlFor='password' className='sr-only'>
-                Password
-              </label>
-              <input
-                id='password'
-                name='password'
-                type='password'
-                autoComplete='current-password'
-                required
-                className='appearance-none rounded-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-b-md focus:outline-none focus:ring-primary focus:border-primary focus:z-10 sm:text-sm'
-                placeholder='Password'
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                disabled={loading}
-              />
-            </div>
-          </div>
-
-          {error && (
-            <div className='rounded-md bg-red-50 p-4'>
-              <div className='text-sm text-red-800'>{error}</div>
-            </div>
-          )}
-
-          <div>
-            <button
-              type='submit'
-              disabled={loading}
-              className='group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-primary hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
-            >
-              {loading ? "Signing in..." : "Sign in"}
-            </button>
-          </div>
-        </form>
       </div>
     </div>
   );

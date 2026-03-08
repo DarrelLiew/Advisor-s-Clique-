@@ -8,12 +8,46 @@ import type { TextContent, TextItem } from "pdfjs-dist/types/src/display/api";
 
 pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
 
+// Common words that carry little discriminating signal — excluded from
+// bag-of-words matching so noise doesn't inflate overlap scores.
+const STOP_WORDS = new Set([
+  "that", "this", "with", "from", "they", "been", "have", "were", "will",
+  "your", "their", "which", "when", "also", "each", "more", "than", "then",
+  "into", "over", "such", "upon", "under", "after", "before", "during",
+  "about", "against", "between", "through", "shall", "would", "could",
+  "should", "these", "those", "there", "where", "while", "other", "some",
+  "make", "made", "only", "both", "must", "does", "done", "used", "been",
+  "were", "paid", "pays", "paid", "plus", "less", "date", "time", "year",
+  "note", "term", "plan", "base", "back",
+]);
+
+/** Words worth matching: long enough and not a stop word. */
+function sigWords(words: string[]): string[] {
+  return words.filter((w) => w.length >= 4 && !STOP_WORDS.has(w));
+}
+
+/** True if a word is a strong anchor (contains a digit, or is ≥ 7 chars). */
+function isAnchorWord(w: string): boolean {
+  return /\d/.test(w) || w.length >= 7;
+}
+
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function normalize(s: string): string {
-  return s.replace(/\s+/g, " ").trim().toLowerCase();
+  return s
+    .replace(/\uFB00/g, "ff")
+    .replace(/\uFB01/g, "fi")
+    .replace(/\uFB02/g, "fl")
+    .replace(/\uFB03/g, "ffi")
+    .replace(/\uFB04/g, "ffl")
+    .replace(/[\u2013\u2014\u2012]/g, "-")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 interface Props {
@@ -104,7 +138,16 @@ export default function PdfViewer({
     [jumpToPage, numPages, scrollToPage],
   );
 
-  // Compute which text-layer items overlap with the chunk text
+  // Compute which text-layer items overlap with the chunk text.
+  //
+  // Phase 1 — LCS (sequence match): finds a run of ≥5 consecutive matching
+  //   words between the page text layer and the chunk. Works perfectly for
+  //   prose paragraphs where both parsers read text in the same order.
+  //
+  // Phase 2 — Bag-of-words fallback: used when Phase 1 finds no run (tables,
+  //   multi-column layouts, scanned slides where pdfjs and the ingestion
+  //   library read cells in different orders). Highlights every text item
+  //   whose words overlap significantly with the chunk's significant words.
   const onGetTextSuccess = useCallback(
     (textContent: TextContent) => {
       if (!highlightText) {
@@ -116,65 +159,95 @@ export default function PdfViewer({
         (item): item is TextItem => "str" in item && !!(item as TextItem).str,
       );
 
-      // Build normalised concatenation and track per-item boundaries
-      let concat = "";
-      const boundaries: Array<{ idx: number; start: number; end: number }> = [];
-
+      // Build per-item word list used by Phase 1.
+      const pageWords: string[] = [];
+      const wordToItem: number[] = [];
       for (let i = 0; i < items.length; i++) {
-        const norm = items[i].str.replace(/\s+/g, " ");
-        if (!norm) continue;
-        if (concat.length > 0) concat += " ";
-        const start = concat.length;
-        concat += norm;
-        boundaries.push({ idx: i, start, end: concat.length });
-      }
-
-      const normConcat = concat.toLowerCase();
-      const normChunk = normalize(highlightText);
-
-      // Try progressively shorter/offset slices to find the best match.
-      // Chunks often start with page headers — skip-header attempts avoid
-      // highlighting boilerplate instead of actual content.
-      // Prioritise longer matches and middle-of-chunk sections over prefixes.
-      const len = normChunk.length;
-      const attempts = [
-        normChunk, // full chunk
-        normChunk.slice(Math.floor(len * 0.15)), // skip header (~15%)
-        normChunk.slice(Math.floor(len * 0.25)), // skip header (~25%)
-        normChunk.slice(0, Math.floor(len * 0.8)), // first 80%
-        normChunk.slice(Math.floor(len * 0.25), Math.floor(len * 0.85)), // middle 60%
-        normChunk.slice(Math.floor(len * 0.15), Math.floor(len * 0.75)), // middle (different window)
-        normChunk.slice(0, Math.floor(len * 0.6)), // first 60%
-        normChunk.slice(Math.floor(len * 0.4)), // last 60%
-        normChunk.slice(Math.floor(len * 0.5)), // last 50%
-        // Short-prefix fallbacks (last resort)
-        normChunk.slice(Math.floor(len * 0.15), Math.floor(len * 0.15) + 200), // 200 chars after header
-        normChunk.slice(Math.floor(len * 0.25), Math.floor(len * 0.25) + 150), // 150 chars after header
-        normChunk.slice(0, 200), // first 200 chars
-        normChunk.slice(0, 100),
-        normChunk.slice(0, 50),
-      ].filter((s) => s.length >= 20);
-
-      let matchStart = -1;
-      let matchLen = 0;
-      for (const attempt of attempts) {
-        const pos = normConcat.indexOf(attempt);
-        if (pos !== -1) {
-          matchStart = pos;
-          matchLen = attempt.length;
-          break;
+        const words = normalize(items[i].str).split(/\s+/).filter(Boolean);
+        for (const w of words) {
+          pageWords.push(w);
+          wordToItem.push(i);
         }
       }
 
-      if (matchStart === -1) {
+      // Image-based / scanned pages have almost no text layer — skip.
+      if (pageWords.length < 20) {
         highlightMapRef.current = null;
         return;
       }
 
-      const matchEnd = matchStart + matchLen;
+      const chunkWords = normalize(highlightText).split(/\s+/).filter(Boolean);
+      if (chunkWords.length < 3) {
+        highlightMapRef.current = null;
+        return;
+      }
+
+      // ── Phase 1: LCS word-sequence matching ──────────────────────────────
+      const MIN_RUN = 5;
+      let bestPageStart = -1;
+      let bestRunLen = 0;
+
+      for (let ps = 0; ps <= pageWords.length - MIN_RUN; ps++) {
+        for (let cs = 0; cs < chunkWords.length; cs++) {
+          if (pageWords[ps] !== chunkWords[cs]) continue;
+          let run = 1;
+          while (
+            ps + run < pageWords.length &&
+            cs + run < chunkWords.length &&
+            pageWords[ps + run] === chunkWords[cs + run]
+          ) {
+            run++;
+          }
+          if (run > bestRunLen) {
+            bestRunLen = run;
+            bestPageStart = ps;
+          }
+        }
+      }
+
+      if (bestPageStart !== -1 && bestRunLen >= MIN_RUN) {
+        const matched = new Set<number>();
+        for (let wi = bestPageStart; wi <= Math.min(bestPageStart + bestRunLen - 1, pageWords.length - 1); wi++) {
+          matched.add(wordToItem[wi]);
+        }
+        if (matched.size > 0) {
+          highlightMapRef.current = matched;
+          return;
+        }
+      }
+
+      // ── Phase 2: Bag-of-words fallback (tables / reordered content) ──────
+      // Build the set of significant words from the chunk.
+      const chunkSig = new Set(sigWords(chunkWords));
+      if (chunkSig.size < 3) {
+        highlightMapRef.current = null;
+        return;
+      }
+
+      // Guard: at least 45% of the chunk's significant words must appear
+      // somewhere on this page, confirming this is actually the right page.
+      const pageWordSet = new Set(pageWords);
+      let pageOverlapCount = 0;
+      for (const w of chunkSig) {
+        if (pageWordSet.has(w)) pageOverlapCount++;
+      }
+      if (pageOverlapCount / chunkSig.size < 0.45) {
+        highlightMapRef.current = null;
+        return;
+      }
+
+      // Highlight each text item that has enough overlap with the chunk.
+      // An item qualifies if:
+      //   • it shares ≥ 2 significant words with the chunk, OR
+      //   • it shares ≥ 1 anchor word (number / long term) with the chunk.
       const matched = new Set<number>();
-      for (const b of boundaries) {
-        if (b.end > matchStart && b.start < matchEnd) matched.add(b.idx);
+      for (let i = 0; i < items.length; i++) {
+        const iWords = sigWords(normalize(items[i].str).split(/\s+/).filter(Boolean));
+        if (iWords.length === 0) continue;
+        const hits = iWords.filter((w) => chunkSig.has(w));
+        if (hits.length >= 2 || (hits.length === 1 && isAnchorWord(hits[0]))) {
+          matched.add(i);
+        }
       }
 
       highlightMapRef.current = matched.size > 0 ? matched : null;

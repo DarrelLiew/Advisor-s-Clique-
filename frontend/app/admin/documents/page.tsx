@@ -156,7 +156,7 @@ export default function DocumentsPage() {
   return (
     <div className='max-w-7xl mx-auto px-6 py-8'>
       <div className='mb-6'>
-        <h2 className='text-2xl font-bold mb-2'>Documents</h2>
+        <h2 className='text-2xl font-bold font-heading mb-2'>Documents</h2>
         <p className='text-gray-600'>
           Upload and manage PDF documents for the chatbot
         </p>
@@ -165,7 +165,7 @@ export default function DocumentsPage() {
       {/* Upload Section */}
       <div className='bg-white rounded-lg shadow-sm border p-6 mb-6'>
         <label className='flex flex-col items-center justify-center border-2 border-dashed border-gray-300 rounded-lg p-12 cursor-pointer hover:border-primary transition'>
-          <Upload className='w-12 h-12 text-gray-400 mb-3' />
+          <Upload className='w-12 h-12 text-gold/40 mb-3' />
           <span className='text-gray-600'>
             {uploading ? "Uploading..." : "Click to upload PDF"}
           </span>
@@ -260,7 +260,7 @@ export default function DocumentsPage() {
                         <button
                           onClick={() => handleReprocess(doc.id)}
                           title='Re-process with current chunk settings'
-                          className='text-gray-400 hover:text-blue-600'
+                          className='text-gray-400 hover:text-gold'
                         >
                           <RefreshCw className='w-4 h-4' />
                         </button>

@@ -36,6 +36,82 @@ function prependLowRelevanceNote(answer: string): string {
   return `${LOW_RELEVANCE_NOTE}\n\n${answer}`;
 }
 
+function extractContextPages(context: string): number[] {
+  const pages = new Set<number>();
+  const headerRegex = /\[[^\]]+,\s*Page\s+(\d+)\]/gi;
+  let match: RegExpExecArray | null;
+  while ((match = headerRegex.exec(context)) !== null) {
+    const page = Number.parseInt(match[1], 10);
+    if (!Number.isNaN(page)) {
+      pages.add(page);
+    }
+  }
+  return Array.from(pages).sort((a, b) => a - b);
+}
+
+function parseCitationPages(token: string): number[] {
+  const pages = new Set<number>();
+  const content = token.slice(1, -1).replace(/^p\./i, '');
+  const segments = content.split(',').map((s) => s.trim()).filter(Boolean);
+
+  for (const segment of segments) {
+    const normalized = segment.replace(/^p\./i, '').trim();
+    const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (rangeMatch) {
+      const start = Number.parseInt(rangeMatch[1], 10);
+      const end = Number.parseInt(rangeMatch[2], 10);
+      for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
+        pages.add(i);
+      }
+      continue;
+    }
+
+    const page = Number.parseInt(normalized, 10);
+    if (!Number.isNaN(page)) {
+      pages.add(page);
+    }
+  }
+
+  return Array.from(pages).sort((a, b) => a - b);
+}
+
+function toCitationSegments(pages: number[]): string[] {
+  if (pages.length === 0) return [];
+  const segments: string[] = [];
+  let start = pages[0];
+  let prev = pages[0];
+
+  for (let i = 1; i < pages.length; i++) {
+    const current = pages[i];
+    if (current === prev + 1) {
+      prev = current;
+      continue;
+    }
+    segments.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = current;
+    prev = current;
+  }
+
+  segments.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return segments;
+}
+
+function sanitizeCitationsToAllowedPages(answer: string, allowedPages: number[]): string {
+  const allowed = new Set<number>(allowedPages);
+  if (allowed.size === 0) return answer;
+
+  return answer
+    .replace(/\[p\.[^\]]+\]/gi, (token) => {
+      const pages = parseCitationPages(token).filter((page) => allowed.has(page));
+      if (pages.length === 0) return '';
+      const segments = toCitationSegments(pages);
+      return `[p.${segments.join(',')}]`;
+    })
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/ +\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 async function sendMessage(
   chatId: number,
   text: string,
@@ -198,13 +274,8 @@ function resolveSourcesForCitations(
   if (citedPages.length === 0) return [];
 
   const bestByPage = new Map<number, { filename: string; page: number; similarity: number; document_id: string; text: string }>();
-  let topChunk: { filename: string; page_number: number; similarity: number; document_id: string; text: string } | null = null;
 
   for (const chunk of chunks) {
-    if (!topChunk || chunk.similarity > topChunk.similarity) {
-      topChunk = chunk;
-    }
-
     const existing = bestByPage.get(chunk.page_number);
     if (!existing || chunk.similarity > existing.similarity) {
       bestByPage.set(chunk.page_number, {
@@ -221,16 +292,7 @@ function resolveSourcesForCitations(
   const seen = new Set<string>();
 
   for (const page of citedPages) {
-    const mapped = bestByPage.get(page);
-    const source = mapped || (topChunk
-      ? {
-        filename: topChunk.filename,
-        page,
-        similarity: topChunk.similarity,
-        document_id: topChunk.document_id,
-        text: topChunk.text,
-      }
-      : null);
+    const source = bestByPage.get(page);
     if (!source) continue;
 
     const key = `${source.document_id}:${page}`;
@@ -361,7 +423,7 @@ async function handleQuery(
   const pipelineStart = Date.now();
   const [domainResult, retrievalResult] = await Promise.all([
     classifyQueryDomain(openai, queryText, conversationHistory),
-    retrieveContextForQuery({ openai, queryText, logLabel: 'telegram', conversationHistory, skipRerank: true }),
+    retrieveContextForQuery({ openai, queryText, logLabel: 'telegram', conversationHistory }),
   ]);
   const domain = domainResult;
   timings.classification_ms = elapsedMs(pipelineStart);
@@ -462,6 +524,8 @@ async function handleQuery(
   if (lowRelevance) {
     answer = prependLowRelevanceNote(answer);
   }
+  const contextPages = extractContextPages(retrieval?.context ?? '');
+  answer = sanitizeCitationsToAllowedPages(answer, contextPages);
   const noDirectAnswer = isNoDirectAnswerInDocs(answer);
   const responseTime = Date.now() - startTime;
 

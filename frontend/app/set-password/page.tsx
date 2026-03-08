@@ -83,8 +83,6 @@ export default function SetPasswordPage() {
         data: { user },
       } = await supabase.auth.getUser();
       if (user) {
-        // Use service client for profile update — but since we're on client side,
-        // we rely on RLS (user can update their own profile)
         await supabase
           .from("profiles")
           .update({ invitation_status: "accepted" })
@@ -111,10 +109,10 @@ export default function SetPasswordPage() {
 
   if (checking) {
     return (
-      <div className='min-h-screen flex items-center justify-center bg-gray-50'>
+      <div className='min-h-screen flex items-center justify-center bg-[#0A0A0A]'>
         <div className='text-center'>
-          <div className='animate-spin rounded-full h-8 w-8 border-b-2 border-primary mx-auto mb-4' />
-          <p className='text-gray-600'>Verifying invitation...</p>
+          <div className='animate-spin rounded-full h-8 w-8 border-b-2 border-gold mx-auto mb-4' />
+          <p className='text-gray-400'>Verifying invitation...</p>
         </div>
       </div>
     );
@@ -122,11 +120,11 @@ export default function SetPasswordPage() {
 
   if (success) {
     return (
-      <div className='min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4'>
+      <div className='min-h-screen flex items-center justify-center bg-[#0A0A0A] py-12 px-4'>
         <div className='max-w-md w-full text-center'>
-          <div className='bg-green-50 border border-green-200 rounded-lg p-8'>
+          <div className='bg-[#1F1F1F] border border-gold/30 rounded-2xl p-8'>
             <svg
-              className='w-12 h-12 text-green-500 mx-auto mb-4'
+              className='w-12 h-12 text-gold mx-auto mb-4'
               fill='none'
               viewBox='0 0 24 24'
               stroke='currentColor'
@@ -138,10 +136,10 @@ export default function SetPasswordPage() {
                 d='M5 13l4 4L19 7'
               />
             </svg>
-            <h2 className='text-xl font-semibold text-green-800 mb-2'>
+            <h2 className='text-xl font-semibold font-heading text-white mb-2'>
               Password Set Successfully!
             </h2>
-            <p className='text-green-700'>Redirecting you to the app...</p>
+            <p className='text-gray-400'>Redirecting you to the app...</p>
           </div>
         </div>
       </div>
@@ -149,75 +147,83 @@ export default function SetPasswordPage() {
   }
 
   return (
-    <div className='min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8'>
-      <div className='max-w-md w-full space-y-8'>
-        <div>
-          <h2 className='mt-6 text-center text-3xl font-extrabold text-gray-900'>
-            Set Your Password
-          </h2>
-          <p className='mt-2 text-center text-sm text-gray-600'>
-            Welcome to Advisors Clique! Create a password to access your
-            account.
-          </p>
-        </div>
-
-        <form className='mt-8 space-y-6' onSubmit={handleSubmit}>
-          <div className='space-y-4'>
-            <div>
-              <label
-                htmlFor='password'
-                className='block text-sm font-medium text-gray-700 mb-1'
-              >
-                Password
-              </label>
-              <input
-                id='password'
-                type='password'
-                required
-                minLength={8}
-                className='appearance-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-md focus:outline-none focus:ring-primary focus:border-primary sm:text-sm'
-                placeholder='At least 8 characters'
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                disabled={loading || !!error}
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor='confirm-password'
-                className='block text-sm font-medium text-gray-700 mb-1'
-              >
-                Confirm Password
-              </label>
-              <input
-                id='confirm-password'
-                type='password'
-                required
-                minLength={8}
-                className='appearance-none relative block w-full px-3 py-2 border border-gray-300 placeholder-gray-500 text-gray-900 rounded-md focus:outline-none focus:ring-primary focus:border-primary sm:text-sm'
-                placeholder='Re-enter your password'
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                disabled={loading || !!error}
-              />
-            </div>
+    <div className='min-h-screen flex items-center justify-center bg-[#0A0A0A] py-12 px-4 sm:px-6 lg:px-8'>
+      <div className='max-w-md w-full'>
+        <div className='bg-white rounded-2xl shadow-xl p-8 space-y-8'>
+          {/* Logo */}
+          <div className='flex flex-col items-center'>
+            <img
+              src='/AC_LogoName_Gold_Primary.png'
+              alt='Advisors Clique'
+              className='h-12 mb-6'
+            />
+            <h2 className='text-center text-2xl font-semibold font-heading text-foreground'>
+              Set Your Password
+            </h2>
+            <p className='mt-2 text-center text-sm text-muted-foreground'>
+              Welcome to Advisors Clique! Create a password to access your
+              account.
+            </p>
           </div>
 
-          {error && (
-            <div className='rounded-md bg-red-50 p-4'>
-              <p className='text-sm text-red-800'>{error}</p>
-            </div>
-          )}
+          <form className='space-y-6' onSubmit={handleSubmit}>
+            <div className='space-y-4'>
+              <div>
+                <label
+                  htmlFor='password'
+                  className='block text-sm font-medium text-foreground mb-1'
+                >
+                  Password
+                </label>
+                <input
+                  id='password'
+                  type='password'
+                  required
+                  minLength={8}
+                  className='appearance-none relative block w-full px-3 py-2.5 border border-border placeholder-muted-foreground text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-gold focus:border-gold sm:text-sm'
+                  placeholder='At least 8 characters'
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={loading || !!error}
+                />
+              </div>
 
-          <button
-            type='submit'
-            disabled={loading || !!error}
-            className='group relative w-full flex justify-center py-2 px-4 border border-transparent text-sm font-medium rounded-md text-white bg-primary hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed'
-          >
-            {loading ? "Setting password..." : "Set Password & Continue"}
-          </button>
-        </form>
+              <div>
+                <label
+                  htmlFor='confirm-password'
+                  className='block text-sm font-medium text-foreground mb-1'
+                >
+                  Confirm Password
+                </label>
+                <input
+                  id='confirm-password'
+                  type='password'
+                  required
+                  minLength={8}
+                  className='appearance-none relative block w-full px-3 py-2.5 border border-border placeholder-muted-foreground text-foreground rounded-lg focus:outline-none focus:ring-2 focus:ring-gold focus:border-gold sm:text-sm'
+                  placeholder='Re-enter your password'
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  disabled={loading || !!error}
+                />
+              </div>
+            </div>
+
+            {error && (
+              <div className='rounded-lg bg-red-50 p-4'>
+                <p className='text-sm text-red-800'>{error}</p>
+              </div>
+            )}
+
+            <button
+              type='submit'
+              disabled={loading || !!error}
+              className='group relative w-full flex justify-center py-2.5 px-4 border border-transparent text-sm font-semibold rounded-lg text-black bg-gold-gradient hover:shadow-gold-glow focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gold disabled:opacity-50 disabled:cursor-not-allowed transition-shadow'
+            >
+              {loading ? "Setting password..." : "Set Password & Continue"}
+            </button>
+          </form>
+        </div>
       </div>
     </div>
   );

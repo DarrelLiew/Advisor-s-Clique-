@@ -24,6 +24,82 @@ function prependLowRelevanceNote(answer: string): string {
   return `${LOW_RELEVANCE_NOTE}\n\n${answer}`;
 }
 
+function extractContextPages(context: string): number[] {
+  const pages = new Set<number>();
+  const headerRegex = /\[[^\]]+,\s*Page\s+(\d+)\]/gi;
+  let match: RegExpExecArray | null;
+  while ((match = headerRegex.exec(context)) !== null) {
+    const page = Number.parseInt(match[1], 10);
+    if (!Number.isNaN(page)) {
+      pages.add(page);
+    }
+  }
+  return Array.from(pages).sort((a, b) => a - b);
+}
+
+function parseCitationPages(token: string): number[] {
+  const pages = new Set<number>();
+  const content = token.slice(1, -1).replace(/^p\./i, '');
+  const segments = content.split(',').map((s) => s.trim()).filter(Boolean);
+
+  for (const segment of segments) {
+    const normalized = segment.replace(/^p\./i, '').trim();
+    const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (rangeMatch) {
+      const start = Number.parseInt(rangeMatch[1], 10);
+      const end = Number.parseInt(rangeMatch[2], 10);
+      for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
+        pages.add(i);
+      }
+      continue;
+    }
+
+    const page = Number.parseInt(normalized, 10);
+    if (!Number.isNaN(page)) {
+      pages.add(page);
+    }
+  }
+
+  return Array.from(pages).sort((a, b) => a - b);
+}
+
+function toCitationSegments(pages: number[]): string[] {
+  if (pages.length === 0) return [];
+  const segments: string[] = [];
+  let start = pages[0];
+  let prev = pages[0];
+
+  for (let i = 1; i < pages.length; i++) {
+    const current = pages[i];
+    if (current === prev + 1) {
+      prev = current;
+      continue;
+    }
+    segments.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = current;
+    prev = current;
+  }
+
+  segments.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return segments;
+}
+
+function sanitizeCitationsToAllowedPages(answer: string, allowedPages: number[]): string {
+  const allowed = new Set<number>(allowedPages);
+  if (allowed.size === 0) return answer;
+
+  return answer
+    .replace(/\[p\.[^\]]+\]/gi, (token) => {
+      const pages = parseCitationPages(token).filter((page) => allowed.has(page));
+      if (pages.length === 0) return '';
+      const segments = toCitationSegments(pages);
+      return `[p.${segments.join(',')}]`;
+    })
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/ +\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 // Extract page numbers from inline citations in the answer.
 // Supports: [p.4], [p.4-5], [p.4-5, p.46], [p.4,5,6]
 function extractCitedPages(answer: string): number[] {
@@ -64,6 +140,30 @@ function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
   return max;
 }
 
+/**
+ * Strip leading page-header boilerplate from chunk text so the viewer can
+ * match it against the PDF text layer.
+ * Headers follow the pattern: <product name>\n<subtitle>\n<N | Page>\n<date line>\n<content>
+ * We drop everything up to and including the "N | Page" line, plus any
+ * immediately-following blank or "Information accurate" lines.
+ */
+function stripChunkHeader(text: string): string {
+  if (!text) return text;
+  const lines = text.split('\n');
+  const pageLineIdx = lines.findIndex((l) => /\d+\s*\|\s*[Pp]age/i.test(l));
+  if (pageLineIdx === -1) return text;
+  let startIdx = pageLineIdx + 1;
+  while (startIdx < lines.length) {
+    const trimmed = lines[startIdx].trim();
+    if (trimmed === '' || /^information accurate/i.test(trimmed)) {
+      startIdx++;
+    } else {
+      break;
+    }
+  }
+  return lines.slice(startIdx).join('\n').trim() || text;
+}
+
 function resolveSourcesForCitations(
   chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string; text?: string }>,
   citedPages: number[],
@@ -71,13 +171,8 @@ function resolveSourcesForCitations(
   if (citedPages.length === 0) return [];
 
   const bestByPage = new Map<number, ChatSource>();
-  let topChunk: (typeof chunks)[number] | null = null;
 
   for (const chunk of chunks) {
-    if (!topChunk || chunk.similarity > topChunk.similarity) {
-      topChunk = chunk;
-    }
-
     const existing = bestByPage.get(chunk.page_number);
     if (!existing || chunk.similarity > existing.similarity) {
       bestByPage.set(chunk.page_number, {
@@ -85,7 +180,7 @@ function resolveSourcesForCitations(
         page: chunk.page_number,
         similarity: chunk.similarity,
         document_id: chunk.document_id,
-        text: chunk.text,
+        text: chunk.text ? stripChunkHeader(chunk.text) : chunk.text,
       });
     }
   }
@@ -94,16 +189,7 @@ function resolveSourcesForCitations(
   const seen = new Set<string>();
 
   for (const page of citedPages) {
-    const mapped = bestByPage.get(page);
-    const source = mapped || (topChunk
-      ? {
-        filename: topChunk.filename,
-        page,
-        similarity: topChunk.similarity,
-        document_id: topChunk.document_id,
-        text: topChunk.text,
-      }
-      : null);
+    const source = bestByPage.get(page);
     if (!source) continue;
 
     const key = `${source.document_id}:${page}`;
@@ -193,14 +279,17 @@ function finalizeChatAnswer(params: {
   }
 
   const citationProcessStart = Date.now();
-  const citedPages = extractCitedPages(answer);
   const maxVectorSimilarity = getMaxVectorSimilarity(retrieval?.chunks ?? []);
   const lowRelevance = maxVectorSimilarity < ragConfig.minSourceSimilarity;
   const noDirectAnswer = isNoDirectAnswerInDocs(answer);
   const shouldCountAsNoDirect = noDirectAnswer || lowRelevance;
+  const contextPages = extractContextPages(retrieval?.context ?? '');
 
   const answerWithNote = lowRelevance ? prependLowRelevanceNote(answer) : answer;
-  let processedAnswer = boldCitations(answerWithNote);
+  const sanitizedAnswer = sanitizeCitationsToAllowedPages(answerWithNote, contextPages);
+  const citedPages = extractCitedPages(sanitizedAnswer);
+
+  let processedAnswer = boldCitations(sanitizedAnswer);
   processedAnswer = formatAnswer(processedAnswer);
 
   const filteredSources = resolveSourcesForCitations(retrieval?.chunks ?? [], citedPages);

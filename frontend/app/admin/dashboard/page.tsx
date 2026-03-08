@@ -102,6 +102,7 @@ export default function AdminDashboard() {
   const [topCategories, setTopCategories] = useState<TopQueryCategory[]>([]);
   const [topCategoriesQuality, setTopCategoriesQuality] = useState<"complete" | "partial">("complete");
   const [loading, setLoading] = useState(true);
+  const [showAllQuestions, setShowAllQuestions] = useState(false);
   const supabase = createClient();
   const router = useRouter();
 
@@ -148,15 +149,15 @@ export default function AdminDashboard() {
   const totalTopCategoryCount = topCategories.reduce((sum, item) => sum + item.count, 0);
 
   return (
-    <div className='min-h-screen bg-gray-50'>
+    <div className='min-h-screen bg-muted'>
       {/* Header */}
-      <div className='bg-white border-b'>
+      <div className='bg-white border-b border-border'>
         <div className='max-w-7xl mx-auto px-6 py-4'>
           <div className='flex justify-between items-center'>
-            <h1 className='text-2xl font-bold'>Admin Dashboard</h1>
+            <h1 className='text-2xl font-bold font-heading text-foreground'>Admin Dashboard</h1>
             <button
               onClick={handleLogout}
-              className='flex items-center gap-2 text-gray-600 hover:text-gray-900'
+              className='flex items-center gap-2 text-muted-foreground hover:text-foreground'
             >
               <LogOut className='w-4 h-4' />
               Logout
@@ -177,9 +178,9 @@ export default function AdminDashboard() {
                 <div className='flex items-center justify-between'>
                   <div>
                     <p className='text-sm text-gray-600 mb-1'>Total Users</p>
-                    <p className='text-3xl font-bold'>{stats.total_users}</p>
+                    <p className='text-3xl font-bold text-gold'>{stats.total_users}</p>
                   </div>
-                  <Users className='w-10 h-10 text-primary opacity-20' />
+                  <Users className='w-10 h-10 text-gold opacity-30' />
                 </div>
               </div>
 
@@ -189,11 +190,11 @@ export default function AdminDashboard() {
                     <p className='text-sm text-gray-600 mb-1'>
                       Total Documents
                     </p>
-                    <p className='text-3xl font-bold'>
+                    <p className='text-3xl font-bold text-gold'>
                       {stats.total_documents}
                     </p>
                   </div>
-                  <FileText className='w-10 h-10 text-primary opacity-20' />
+                  <FileText className='w-10 h-10 text-gold opacity-30' />
                 </div>
               </div>
 
@@ -203,45 +204,13 @@ export default function AdminDashboard() {
                     <p className='text-sm text-gray-600 mb-1'>
                       Questions (30 days)
                     </p>
-                    <p className='text-3xl font-bold'>
+                    <p className='text-3xl font-bold text-gold'>
                       {stats.questions_last_30_days}
                     </p>
                   </div>
-                  <MessageSquare className='w-10 h-10 text-primary opacity-20' />
+                  <MessageSquare className='w-10 h-10 text-gold opacity-30' />
                 </div>
               </div>
-            </div>
-
-            {/* Commonly Asked Questions */}
-            <div className='bg-white rounded-lg shadow-sm border p-6'>
-              <h2 className='text-lg font-semibold mb-4'>Commonly Asked Questions (Current Month)</h2>
-              {commonQuestionsQuality === "partial" && (
-                <p className='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-3'>
-                  Analytics data is partial. Run the metadata migration to restore full accuracy.
-                </p>
-              )}
-              {commonQuestions.length > 0 ? (
-                <div className='space-y-3'>
-                  {commonQuestions.map((q, idx) => (
-                    <div key={idx} className='border-b pb-3 last:border-0'>
-                      <div className='flex items-center justify-between gap-3'>
-                        <p className='text-sm font-medium'>{q.question}</p>
-                        <span className='text-xs font-semibold bg-gray-100 px-2 py-1 rounded-full'>
-                          {q.count}
-                        </span>
-                      </div>
-                      <div className='text-xs text-gray-500 mt-1 flex flex-wrap items-center gap-2'>
-                        <span className='inline-flex items-center rounded bg-blue-50 text-blue-700 px-2 py-0.5 border border-blue-100'>
-                          {q.category}
-                        </span>
-                        <span>Last asked: {formatSingaporeDateTime(q.last_asked_at)}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className='text-gray-500 text-sm'>No common questions in the current month.</p>
-              )}
             </div>
 
             <div className='grid grid-cols-1 lg:grid-cols-3 gap-6'>
@@ -331,7 +300,7 @@ export default function AdminDashboard() {
             <div className='grid grid-cols-1 md:grid-cols-2 gap-6'>
               <Link href='/admin/documents'>
                 <div className='bg-white p-6 rounded-lg shadow-sm border hover:shadow-md transition cursor-pointer'>
-                  <FileText className='w-8 h-8 text-primary mb-3' />
+                  <FileText className='w-8 h-8 text-gold mb-3' />
                   <h3 className='font-semibold mb-1'>Manage Documents</h3>
                   <p className='text-sm text-gray-600'>
                     Upload and manage PDF documents
@@ -341,13 +310,53 @@ export default function AdminDashboard() {
 
               <Link href='/admin/users'>
                 <div className='bg-white p-6 rounded-lg shadow-sm border hover:shadow-md transition cursor-pointer'>
-                  <Users className='w-8 h-8 text-primary mb-3' />
-                  <h3 className='font-semibold mb-1'>User Management</h3>
+                  <Users className='w-8 h-8 text-gold mb-3' />
+                  <h3 className='font-semibold mb-1'>Manage Users</h3>
                   <p className='text-sm text-gray-600'>
                     Create and manage user accounts
                   </p>
                 </div>
               </Link>
+            </div>
+
+            {/* Commonly Asked Questions */}
+            <div className='bg-white rounded-lg shadow-sm border p-6'>
+              <h2 className='text-lg font-semibold mb-4'>Commonly Asked Questions (Current Month)</h2>
+              {commonQuestionsQuality === "partial" && (
+                <p className='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2 mb-3'>
+                  Analytics data is partial. Run the metadata migration to restore full accuracy.
+                </p>
+              )}
+              {commonQuestions.length > 0 ? (
+                <div className='space-y-3'>
+                  {(showAllQuestions ? commonQuestions : commonQuestions.slice(0, 5)).map((q, idx) => (
+                    <div key={idx} className='border-b pb-3 last:border-0'>
+                      <div className='flex items-center justify-between gap-3'>
+                        <p className='text-sm font-medium'>{q.question}</p>
+                        <span className='text-xs font-semibold bg-gray-100 px-2 py-1 rounded-full'>
+                          {q.count}
+                        </span>
+                      </div>
+                      <div className='text-xs text-gray-500 mt-1 flex flex-wrap items-center gap-2'>
+                        <span className='inline-flex items-center rounded bg-gold/10 text-gold-dark px-2 py-0.5 border border-gold/20'>
+                          {q.category}
+                        </span>
+                        <span>Last asked: {formatSingaporeDateTime(q.last_asked_at)}</span>
+                      </div>
+                    </div>
+                  ))}
+                  {commonQuestions.length > 5 && (
+                    <button
+                      onClick={() => setShowAllQuestions((prev) => !prev)}
+                      className='text-sm text-gold hover:text-gold-dark font-medium transition-colors pt-1'
+                    >
+                      {showAllQuestions ? "Show less" : `See more (${commonQuestions.length - 5} more)`}
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <p className='text-gray-500 text-sm'>No common questions in the current month.</p>
+              )}
             </div>
           </div>
         ) : (

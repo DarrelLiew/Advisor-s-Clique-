@@ -141,6 +141,8 @@ const REWRITE_CONTEXT_DEPENDENT_PATTERN =
   /\b(it|this|that|these|those|they|them|their|he|she|its|there|here|same|again|above|below|previous|earlier|latter|former|more|elaborate|clarify)\b/i;
 const CLEAR_OFF_TOPIC_PATTERN =
   /\b(super bowl|nba|nfl|epl|mlb|nhl|score|match result|weather|temperature|rain|recipe|cook|restaurant|movie|film|netflix|music|song|celebrity|gossip|travel itinerary|flight status|game walkthrough)\b/i;
+const COMPARATIVE_QUERY_PATTERN =
+  /\b(compare|comparison|versus|vs\.?|difference|different|best|better|worst|higher|highest|lower|lowest|shortest|longest|rank|ranking|top|breakeven|break even|which product)\b/i;
 
 function shouldBypassRewriteModel(
   queryText: string,
@@ -162,6 +164,10 @@ function shouldBypassRewriteModel(
 
 function hasClearOffTopicSignal(query: string): boolean {
   return CLEAR_OFF_TOPIC_PATTERN.test(query.toLowerCase());
+}
+
+function isComparativeQuery(query: string): boolean {
+  return COMPARATIVE_QUERY_PATTERN.test(query.toLowerCase());
 }
 
 export async function rewriteQueryForRetrieval(
@@ -366,21 +372,104 @@ async function rerankChunks(
   }
 }
 
-function toContext(chunks: RetrievedChunk[]): string {
+function reorderForCoverage(chunks: RetrievedChunk[]): RetrievedChunk[] {
+  const seenPage = new Set<string>();
+  const prioritized: RetrievedChunk[] = [];
+  const remainder: RetrievedChunk[] = [];
+
+  for (const chunk of chunks) {
+    const key = `${chunk.document_id}:${chunk.page_number}`;
+    if (seenPage.has(key)) {
+      remainder.push(chunk);
+      continue;
+    }
+    seenPage.add(key);
+    prioritized.push(chunk);
+  }
+
+  return [...prioritized, ...remainder];
+}
+
+/**
+ * For comparative queries, ensure multiple documents are represented in the
+ * context by round-robin interleaving — take the top chunks from each
+ * document before filling with the rest.  Without this, a single highly-
+ * relevant document dominates and the LLM can't compare products.
+ */
+function ensureDocumentDiversity(
+  chunks: RetrievedChunk[],
+  minChunksPerDoc: number = 3,
+): RetrievedChunk[] {
+  // Group by document, preserving per-document ordering
+  const byDoc = new Map<string, RetrievedChunk[]>();
+  for (const chunk of chunks) {
+    const existing = byDoc.get(chunk.document_id);
+    if (existing) {
+      existing.push(chunk);
+    } else {
+      byDoc.set(chunk.document_id, [chunk]);
+    }
+  }
+
+  // Only one document — nothing to diversify
+  if (byDoc.size <= 1) return chunks;
+
+  // Round-robin: guarantee minChunksPerDoc from each document first
+  const prioritized: RetrievedChunk[] = [];
+  const usedKeys = new Set<string>();
+
+  for (const [, docChunks] of byDoc) {
+    for (let i = 0; i < Math.min(minChunksPerDoc, docChunks.length); i++) {
+      const c = docChunks[i];
+      const key = `${c.document_id}:${c.page_number}:${c.text.slice(0, 40)}`;
+      prioritized.push(c);
+      usedKeys.add(key);
+    }
+  }
+
+  // Fill with remaining chunks in their original order
+  for (const chunk of chunks) {
+    const key = `${chunk.document_id}:${chunk.page_number}:${chunk.text.slice(0, 40)}`;
+    if (!usedKeys.has(key)) {
+      prioritized.push(chunk);
+    }
+  }
+
+  return prioritized;
+}
+
+function toContext(
+  chunks: RetrievedChunk[],
+  options?: {
+    comparativeQuery?: boolean;
+  },
+): string {
+  const comparativeQuery = options?.comparativeQuery ?? false;
+  // For comparative queries: first ensure multiple documents are represented,
+  // then deduplicate pages within each document.
+  const contextPool = comparativeQuery
+    ? reorderForCoverage(ensureDocumentDiversity(chunks))
+    : chunks;
+  const maxContextChunks = comparativeQuery
+    ? Math.min(ragConfig.maxContextChunks + 6, 24)
+    : ragConfig.maxContextChunks;
+  const maxContextChars = comparativeQuery
+    ? Math.min(ragConfig.maxContextChars + 6000, 30000)
+    : ragConfig.maxContextChars;
   const selected: RetrievedChunk[] = [];
   let totalChars = 0;
 
-  for (const chunk of chunks) {
-    if (selected.length >= ragConfig.maxContextChunks) break;
+  for (const chunk of contextPool) {
+    if (selected.length >= maxContextChunks) break;
 
     const block = `[${chunk.filename}, Page ${chunk.page_number}]\n${chunk.text}`;
     const separatorLength = selected.length === 0 ? 0 : '\n\n---\n\n'.length;
     const nextTotal = totalChars + separatorLength + block.length;
 
-    if (nextTotal > ragConfig.maxContextChars) {
+    if (nextTotal > maxContextChars) {
       if (selected.length === 0) {
         const header = `[${chunk.filename}, Page ${chunk.page_number}]\n`;
-        const remaining = Math.max(0, ragConfig.maxContextChars - header.length);
+        const remaining = Math.max(0, maxContextChars - header.length);
         return `${header}${chunk.text.slice(0, remaining)}`;
       }
       break;
@@ -426,6 +515,10 @@ export async function retrieveContextForQuery(params: {
 }) {
   const { openai, queryText, logLabel, conversationHistory, skipRerank } = params;
   const rewrittenQuery = await rewriteQueryForRetrieval(openai, queryText, conversationHistory);
+  const comparativeQuery = isComparativeQuery(rewrittenQuery);
+  const effectiveMatchCount = comparativeQuery
+    ? Math.min(ragConfig.matchCount * 3, 30)
+    : ragConfig.matchCount;
 
   // Option C: Check embedding cache first
   let queryEmbedding: number[];
@@ -453,7 +546,7 @@ export async function retrieveContextForQuery(params: {
     query_embedding: queryEmbedding,
     query_text: rewrittenQuery,
     match_threshold: ragConfig.matchThreshold,
-    match_count: ragConfig.matchCount,
+    match_count: effectiveMatchCount,
     filter_document_ids: null,
   });
   data = hybridResult.data;
@@ -465,7 +558,7 @@ export async function retrieveContextForQuery(params: {
     const vectorResult = await supabase.rpc('search_documents', {
       query_embedding: queryEmbedding,
       match_threshold: ragConfig.matchThreshold,
-      match_count: ragConfig.matchCount,
+      match_count: effectiveMatchCount,
       filter_document_ids: null,
     });
     data = vectorResult.data;
@@ -483,22 +576,41 @@ export async function retrieveContextForQuery(params: {
 
   // Page-expansion: fetch all chunks from a capped set of high-confidence pages.
   // This keeps table/list reconstruction while reducing latency and context size.
-  const vectorMatchedChunks = chunks.filter((c) => c.similarity >= 0.50);
-  const expansionSeedChunks = vectorMatchedChunks.slice(0, ragConfig.maxVectorMatchesForExpansion);
+  const expansionMinSimilarity = comparativeQuery ? 0.40 : 0.50;
+  const vectorMatchedChunks = chunks.filter((c) => c.similarity >= expansionMinSimilarity);
+  const maxVectorMatchesForExpansion = comparativeQuery
+    ? Math.max(ragConfig.maxVectorMatchesForExpansion, 10)
+    : ragConfig.maxVectorMatchesForExpansion;
+  const maxPagesForExpansion = comparativeQuery
+    ? Math.max(ragConfig.maxPagesForExpansion, 10)
+    : ragConfig.maxPagesForExpansion;
+  const expansionSeedChunks = vectorMatchedChunks.slice(0, maxVectorMatchesForExpansion);
   if (expansionSeedChunks.length > 0) {
-    const docIds = [...new Set(expansionSeedChunks.map((c) => c.document_id))];
-    const pageNums = [...new Set(expansionSeedChunks.map((c) => c.page_number))].slice(0, ragConfig.maxPagesForExpansion);
+    const pagesByDoc = new Map<string, Set<number>>();
+    for (const chunk of expansionSeedChunks) {
+      const existing = pagesByDoc.get(chunk.document_id) ?? new Set<number>();
+      existing.add(chunk.page_number);
+      pagesByDoc.set(chunk.document_id, existing);
+    }
 
-    const { data: pageData } = await supabase.rpc('get_chunks_by_pages', {
-      doc_ids: docIds,
-      page_nums: pageNums,
-    });
+    const expansionFetches = Array.from(pagesByDoc.entries()).map(([docId, pages]) =>
+      supabase.rpc('get_chunks_by_pages', {
+        doc_ids: [docId],
+        page_nums: Array.from(pages).slice(0, maxPagesForExpansion),
+      })
+    );
+    const expansionResults = await Promise.all(expansionFetches);
 
-    if (pageData && pageData.length > 0) {
-      const existingKeys = new Set(
-        chunks.map((c) => `${c.document_id}:${c.page_number}:${c.text.slice(0, 40)}`)
-      );
-      for (const pc of pageData as any[]) {
+    const existingKeys = new Set(
+      chunks.map((c) => `${c.document_id}:${c.page_number}:${c.text.slice(0, 40)}`)
+    );
+
+    for (const result of expansionResults) {
+      const pageData = result.data as any[] | null;
+      if (!pageData || pageData.length === 0) {
+        continue;
+      }
+      for (const pc of pageData) {
         const key = `${pc.document_id}:${pc.page_number}:${(pc.text || '').slice(0, 40)}`;
         if (!existingKeys.has(key)) {
           chunks.push({
@@ -511,9 +623,10 @@ export async function retrieveContextForQuery(params: {
           existingKeys.add(key);
         }
       }
-      // Keep vector-matched chunks first, then expanded chunks in page order
-      chunks.sort((a, b) => b.similarity - a.similarity || a.page_number - b.page_number);
     }
+
+    // Keep vector-matched chunks first, then expanded chunks in page order
+    chunks.sort((a, b) => b.similarity - a.similarity || a.page_number - b.page_number);
   }
 
   // Rerank chunks using gpt-4o-mini for better relevance ordering (skippable for latency-sensitive callers)
@@ -521,9 +634,12 @@ export async function retrieveContextForQuery(params: {
   const rerankedChunks = skipRerank ? chunks : await rerankChunks(openai, rewrittenQuery, chunks);
   const rerankMs = Date.now() - rerankStart;
 
+  const uniqueDocs = new Set(rerankedChunks.map((c) => c.filename));
   console.log(
     `[RAG][${logLabel}] query="${queryText}" rewritten="${rewrittenQuery}" chunks=${rerankedChunks.length} ` +
     `(${vectorMatchedChunks.length} vector, ${rerankedChunks.length - vectorMatchedChunks.length} page-expanded) ` +
+    `comparative=${comparativeQuery} match_count=${effectiveMatchCount} ` +
+    `unique_docs=${uniqueDocs.size} docs=[${Array.from(uniqueDocs).join(', ')}] ` +
     `rerank_ms=${rerankMs} ` +
     `top=${rerankedChunks.slice(0, 5).map((c) => `${c.filename}:p${c.page_number}@${c.similarity.toFixed(3)}`).join(', ')}`
   );
@@ -531,9 +647,7 @@ export async function retrieveContextForQuery(params: {
   return {
     rewrittenQuery,
     chunks: rerankedChunks,
-    context: toContext(rerankedChunks),
+    context: toContext(rerankedChunks, { comparativeQuery }),
     sources: buildSources(chunks), // Use original chunks for sources (they have similarity scores)
   };
 }
-
-
