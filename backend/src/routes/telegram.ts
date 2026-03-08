@@ -8,7 +8,7 @@ import { classifyQueryDomain, retrieveContextForQuery } from '../services/retrie
 import { telegramLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
-import { buildSystemPrompt, formatForTelegram, stripHtmlTags } from '../services/promptBuilder';
+import { buildSystemPrompt, buildNumberedContext, formatForTelegram, stripHtmlTags, ReferenceEntry } from '../services/promptBuilder';
 import { ragConfig } from '../services/ragConfig';
 
 const router = Router();
@@ -36,76 +36,22 @@ function prependLowRelevanceNote(answer: string): string {
   return `${LOW_RELEVANCE_NOTE}\n\n${answer}`;
 }
 
-function extractContextPages(context: string): number[] {
-  const pages = new Set<number>();
-  const headerRegex = /\[[^\]]+,\s*Page\s+(\d+)\]/gi;
-  let match: RegExpExecArray | null;
-  while ((match = headerRegex.exec(context)) !== null) {
-    const page = Number.parseInt(match[1], 10);
-    if (!Number.isNaN(page)) {
-      pages.add(page);
-    }
+function extractCitedRefs(answer: string): number[] {
+  const refs = new Set<number>();
+  const matches = answer.match(/\[(\d+)\]/g) || [];
+  for (const m of matches) {
+    const n = parseInt(m.slice(1, -1), 10);
+    if (!Number.isNaN(n)) refs.add(n);
   }
-  return Array.from(pages).sort((a, b) => a - b);
+  return Array.from(refs).sort((a, b) => a - b);
 }
 
-function parseCitationPages(token: string): number[] {
-  const pages = new Set<number>();
-  const content = token.slice(1, -1).replace(/^p\./i, '');
-  const segments = content.split(',').map((s) => s.trim()).filter(Boolean);
-
-  for (const segment of segments) {
-    const normalized = segment.replace(/^p\./i, '').trim();
-    const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
-    if (rangeMatch) {
-      const start = Number.parseInt(rangeMatch[1], 10);
-      const end = Number.parseInt(rangeMatch[2], 10);
-      for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
-        pages.add(i);
-      }
-      continue;
-    }
-
-    const page = Number.parseInt(normalized, 10);
-    if (!Number.isNaN(page)) {
-      pages.add(page);
-    }
-  }
-
-  return Array.from(pages).sort((a, b) => a - b);
-}
-
-function toCitationSegments(pages: number[]): string[] {
-  if (pages.length === 0) return [];
-  const segments: string[] = [];
-  let start = pages[0];
-  let prev = pages[0];
-
-  for (let i = 1; i < pages.length; i++) {
-    const current = pages[i];
-    if (current === prev + 1) {
-      prev = current;
-      continue;
-    }
-    segments.push(start === prev ? `${start}` : `${start}-${prev}`);
-    start = current;
-    prev = current;
-  }
-
-  segments.push(start === prev ? `${start}` : `${start}-${prev}`);
-  return segments;
-}
-
-function sanitizeCitationsToAllowedPages(answer: string, allowedPages: number[]): string {
-  const allowed = new Set<number>(allowedPages);
-  if (allowed.size === 0) return answer;
-
+function sanitizeCitationsToAllowedRefs(answer: string, allowedRefs: Set<number>): string {
+  if (allowedRefs.size === 0) return answer;
   return answer
-    .replace(/\[p\.[^\]]+\]/gi, (token) => {
-      const pages = parseCitationPages(token).filter((page) => allowed.has(page));
-      if (pages.length === 0) return '';
-      const segments = toCitationSegments(pages);
-      return `[p.${segments.join(',')}]`;
+    .replace(/\[(\d+)\]/g, (token, numStr: string) => {
+      const n = parseInt(numStr, 10);
+      return allowedRefs.has(n) ? token : '';
     })
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/ +\n/g, '\n')
@@ -227,37 +173,7 @@ async function editMessageText(
   }
 }
 
-// Extract page numbers from inline citations.
-// Supports: [p.4], [p.4-5], [p.4-5, p.46], [p.4,5,6]
-function extractCitedPages(answer: string): number[] {
-  const pages = new Set<number>();
-  const bracketCitations = answer.match(/\[p\.[^\]]+\]/gi) || [];
-
-  bracketCitations.forEach((match) => {
-    const content = match.slice(1, -1).replace(/^p\./i, '');
-    const segments = content.split(',').map((s) => s.trim()).filter(Boolean);
-
-    for (const segment of segments) {
-      const normalized = segment.replace(/^p\./i, '').trim();
-      const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
-      if (rangeMatch) {
-        const start = parseInt(rangeMatch[1], 10);
-        const end = parseInt(rangeMatch[2], 10);
-        for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
-          pages.add(i);
-        }
-        continue;
-      }
-
-      const page = parseInt(normalized, 10);
-      if (!Number.isNaN(page)) {
-        pages.add(page);
-      }
-    }
-  });
-
-  return Array.from(pages).sort((a, b) => a - b);
-}
+// (extractCitedRefs and sanitizeCitationsToAllowedRefs are defined above)
 
 function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
   let max = 0;
@@ -267,42 +183,37 @@ function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
   return max;
 }
 
-function resolveSourcesForCitations(
+function resolveSourcesForRefs(
+  referenceMap: ReferenceEntry[],
   chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string; text: string }>,
-  citedPages: number[],
-): Array<{ filename: string; page: number; document_id: string; text: string }> {
-  if (citedPages.length === 0) return [];
+  citedRefs: number[],
+): Array<{ ref: number; filename: string; page: number; document_id: string; text: string }> {
+  if (citedRefs.length === 0) return [];
 
-  const bestByPage = new Map<number, { filename: string; page: number; similarity: number; document_id: string; text: string }>();
+  const refLookup = new Map<number, ReferenceEntry>();
+  for (const entry of referenceMap) refLookup.set(entry.refNum, entry);
 
-  for (const chunk of chunks) {
-    const existing = bestByPage.get(chunk.page_number);
-    if (!existing || chunk.similarity > existing.similarity) {
-      bestByPage.set(chunk.page_number, {
-        filename: chunk.filename,
-        page: chunk.page_number,
-        similarity: chunk.similarity,
-        document_id: chunk.document_id,
-        text: chunk.text,
-      });
-    }
-  }
+  const resolved: Array<{ ref: number; filename: string; page: number; document_id: string; text: string }> = [];
+  const seen = new Set<number>();
 
-  const resolved: Array<{ filename: string; page: number; document_id: string; text: string }> = [];
-  const seen = new Set<string>();
+  for (const refNum of citedRefs) {
+    if (seen.has(refNum)) continue;
+    seen.add(refNum);
+    const entry = refLookup.get(refNum);
+    if (!entry) continue;
 
-  for (const page of citedPages) {
-    const source = bestByPage.get(page);
-    if (!source) continue;
+    const matching = chunks.filter(
+      (c) => c.filename === entry.filename && c.page_number === entry.page,
+    );
+    const best = matching.sort((a, b) => b.similarity - a.similarity)[0];
+    if (!best) continue;
 
-    const key = `${source.document_id}:${page}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
     resolved.push({
-      filename: source.filename,
-      page: source.page,
-      document_id: source.document_id,
-      text: source.text,
+      ref: refNum,
+      filename: best.filename,
+      page: best.page_number,
+      document_id: best.document_id,
+      text: best.text,
     });
   }
 
@@ -445,7 +356,7 @@ async function handleQuery(
   // Use retrieval result from parallel call
   retrieval = retrievalResult;
   timings.retrieval_ms = elapsedMs(pipelineStart);
-  if (!retrieval.context) {
+  if (!retrieval.context || !domain.in_domain) {
     usedWebFallback = true;
   }
 
@@ -455,10 +366,12 @@ async function handleQuery(
   }
 
   // 2. Build system prompt using unified builder (same as web app, only formatting differs)
+  const { numberedContext, referenceMap } = buildNumberedContext(retrieval?.context || '');
   const systemPrompt = buildSystemPrompt(
-    retrieval?.context || '',
+    numberedContext,
     'client',
     usedWebFallback,
+    referenceMap,
   );
 
   // Stop typing interval — we're about to stream
@@ -524,8 +437,8 @@ async function handleQuery(
   if (lowRelevance) {
     answer = prependLowRelevanceNote(answer);
   }
-  const contextPages = extractContextPages(retrieval?.context ?? '');
-  answer = sanitizeCitationsToAllowedPages(answer, contextPages);
+  const allowedRefs = new Set(referenceMap.map((r) => r.refNum));
+  answer = sanitizeCitationsToAllowedRefs(answer, allowedRefs);
   const noDirectAnswer = isNoDirectAnswerInDocs(answer);
   const responseTime = Date.now() - startTime;
 
@@ -537,8 +450,8 @@ async function handleQuery(
 
   if (!usedWebFallback && retrieval) {
     const citationProcessStart = Date.now();
-    const citedPages = extractCitedPages(answer);
-    const citedSources = resolveSourcesForCitations(retrieval.chunks, citedPages);
+    const citedRefs = extractCitedRefs(answer);
+    const citedSources = resolveSourcesForRefs(referenceMap, retrieval.chunks, citedRefs);
     timings.citation_mapping_ms = elapsedMs(citationProcessStart);
 
     const buttons: Array<{ text: string; url: string }> = [];
@@ -556,7 +469,7 @@ async function handleQuery(
         ? `${frontendUrl}/view-document?url=${encodeURIComponent(signedUrl)}&page=${source.page}${highlightText ? `&text=${highlightText}` : ''}`
         : `${signedUrl}#page=${source.page}`;
 
-      buttons.push({ text: `${label} p.${source.page}`, url: buttonUrl });
+      buttons.push({ text: `[${source.ref}] ${label} p.${source.page}`, url: buttonUrl });
     }
 
     const inline_keyboard: Array<Array<{ text: string; url: string }>> = [];

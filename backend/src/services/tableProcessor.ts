@@ -30,7 +30,10 @@ export interface VisionExtractionResult {
 
 /**
  * Scans extracted page text and separates table-like regions from prose.
- * Heuristic: lines with 3+ whitespace-separated columns of similar width.
+ * Broadened heuristics:
+ *  - Lines with 2+ whitespace-separated columns
+ *  - Lines with multiple percentage or currency values
+ *  - Lines starting with a number followed by values (row data)
  */
 export function detectTableRegions(pageText: string): DetectedTables {
   const lines = pageText.split('\n');
@@ -40,14 +43,44 @@ export function detectTableRegions(pageText: string): DetectedTables {
   let inTable = false;
 
   for (const line of lines) {
-    const columns = line
-      .trim()
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (inTable) {
+        // Blank line inside a table — end the region
+        if (currentTable.length >= 2) {
+          tables.push(currentTable.join('\n'));
+        } else {
+          nonTableLines.push(...currentTable);
+        }
+        currentTable = [];
+        inTable = false;
+      }
+      nonTableLines.push(line);
+      continue;
+    }
+
+    const columns = trimmed
       .split(/\s{2,}|\t/)
       .filter(Boolean);
-    const hasTablePattern =
-      columns.length >= 3 && columns.every((c) => c.length < 40);
 
-    if (hasTablePattern) {
+    // Heuristic 1: 2+ whitespace-separated columns, each reasonably short
+    const hasColumnPattern =
+      columns.length >= 2 && columns.every((c) => c.length < 50);
+
+    // Heuristic 2: line contains 2+ percentage values (e.g. "100%  75%  80%")
+    const percentMatches = trimmed.match(/\d+\.?\d*\s*%/g);
+    const hasMultiplePercents = percentMatches !== null && percentMatches.length >= 2;
+
+    // Heuristic 3: line contains 2+ currency/numeric values with common separators
+    const numericCols = trimmed.match(/(?:\$[\d,.]+|\d{1,3}(?:,\d{3})+(?:\.\d+)?)/g);
+    const hasMultipleNumerics = numericCols !== null && numericCols.length >= 2;
+
+    // Heuristic 4: line starts with a number/year and is followed by values (table row)
+    const isNumberedRow = /^\d{1,4}(?:\s+onwards)?\s{2,}/.test(trimmed);
+
+    const isTableLine = hasColumnPattern || hasMultiplePercents || hasMultipleNumerics || isNumberedRow;
+
+    if (isTableLine) {
       if (!inTable) inTable = true;
       currentTable.push(line);
     } else {
@@ -311,14 +344,22 @@ export async function extractTablesViaVision(
   pageImageBase64: string,
   pageNumber: number,
 ): Promise<VisionExtractionResult> {
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o',
-    temperature: 0,
-    max_tokens: 4000,
-    messages: [
+  const VISION_TIMEOUT_MS = 60_000; // 60s timeout per page
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), VISION_TIMEOUT_MS);
+
+  try {
+    console.log(`[TABLE] page ${pageNumber}: starting GPT-4o vision call...`);
+    const response = await openai.chat.completions.create(
       {
-        role: 'system',
-        content: `You extract content from financial document pages. Separate tables from body text.
+        model: 'gpt-4o',
+        temperature: 0,
+        max_tokens: 4000,
+        messages: [
+          {
+            role: 'system',
+            content: `You extract content from financial document pages. Separate tables from body text.
 
 For tables:
 - Output each table as a markdown table with correct headers
@@ -330,49 +371,55 @@ For tables:
 For body text:
 - Output all non-table text between tables, preserving reading order
 - Mark as: <!-- TEXT_START --> and <!-- TEXT_END -->`,
-      },
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `Extract all content from page ${pageNumber}. Separate tables from body text.`,
           },
           {
-            type: 'image_url',
-            image_url: {
-              url: `data:image/png;base64,${pageImageBase64}`,
-            },
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `Extract all content from page ${pageNumber}. Separate tables from body text.`,
+              },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/png;base64,${pageImageBase64}`,
+                },
+              },
+            ],
           },
         ],
       },
-    ],
-  });
+      { signal: controller.signal },
+    );
 
-  const content = response.choices[0].message.content || '';
+    const content = response.choices[0].message.content || '';
+    console.log(`[TABLE] page ${pageNumber}: vision call complete (${content.length} chars)`);
 
-  const tables: string[] = [];
-  const textParts: string[] = [];
+    const tables: string[] = [];
+    const textParts: string[] = [];
 
-  const tableRegex =
-    /<!-- TABLE_START -->\s*([\s\S]*?)\s*<!-- TABLE_END -->/g;
-  const textRegex =
-    /<!-- TEXT_START -->\s*([\s\S]*?)\s*<!-- TEXT_END -->/g;
+    const tableRegex =
+      /<!-- TABLE_START -->\s*([\s\S]*?)\s*<!-- TABLE_END -->/g;
+    const textRegex =
+      /<!-- TEXT_START -->\s*([\s\S]*?)\s*<!-- TEXT_END -->/g;
 
-  let match;
-  while ((match = tableRegex.exec(content)) !== null) {
-    tables.push(match[1].trim());
+    let match;
+    while ((match = tableRegex.exec(content)) !== null) {
+      tables.push(match[1].trim());
+    }
+    while ((match = textRegex.exec(content)) !== null) {
+      textParts.push(match[1].trim());
+    }
+
+    // Fallback: if no markers found, treat entire response as text
+    if (tables.length === 0 && textParts.length === 0) {
+      textParts.push(content);
+    }
+
+    return { tables, pageText: textParts.join('\n\n') };
+  } finally {
+    clearTimeout(timeout);
   }
-  while ((match = textRegex.exec(content)) !== null) {
-    textParts.push(match[1].trim());
-  }
-
-  // Fallback: if no markers found, treat entire response as text
-  if (tables.length === 0 && textParts.length === 0) {
-    textParts.push(content);
-  }
-
-  return { tables, pageText: textParts.join('\n\n') };
 }
 
 // ============================================================================
@@ -386,9 +433,9 @@ export interface TableChunk {
 
 /**
  * Processes a single page with the hybrid approach:
- * - Detect table regions via text heuristics
- * - If complex table indicators + page image available → use GPT-4o vision
- * - Otherwise → enrich tables via gpt-4o-mini
+ * - Detect table regions via broadened text heuristics
+ * - If page image is available → use GPT-4o vision for accurate extraction
+ * - Otherwise → enrich tables via gpt-4o-mini (text-only fallback)
  *
  * Returns: { nonTableText, tableChunks[] }
  */
@@ -408,27 +455,24 @@ export async function processPageTables(
   );
 
   const tableChunks: TableChunk[] = [];
-  const isComplex =
-    hasComplexTableIndicators(textTables, page.text) &&
-    pageImageBase64 !== null;
+  const useVision = pageImageBase64 !== null;
 
-  if (isComplex) {
-    // Vision path: send page image to GPT-4o
+  if (useVision) {
+    // Vision path: send page image to GPT-4o for accurate table extraction
     console.log(
-      `[TABLE] page ${page.page_number}: complex table detected, using vision extraction`,
+      `[TABLE] page ${page.page_number}: table detected, using vision extraction`,
     );
     try {
       const { tables: visionTables, pageText: visionText } =
         await extractTablesViaVision(openai, pageImageBase64!, page.page_number);
 
+      console.log(
+        `[TABLE] page ${page.page_number}: vision extracted ${visionTables.length} table(s), ${visionText.length} chars text`,
+      );
+
       for (const table of visionTables) {
-        const enriched = await enrichTable(
-          openai,
-          table,
-          page.page_number,
-          visionText.slice(0, 500),
-        );
-        const parts = splitLargeTable(enriched);
+        // Vision tables are already clean markdown — skip enrichment, just split if needed
+        const parts = splitLargeTable(table);
         for (const part of parts) {
           tableChunks.push({ pageNumber: page.page_number, text: part });
         }

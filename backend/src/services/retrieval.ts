@@ -142,7 +142,7 @@ const REWRITE_CONTEXT_DEPENDENT_PATTERN =
 const CLEAR_OFF_TOPIC_PATTERN =
   /\b(super bowl|nba|nfl|epl|mlb|nhl|score|match result|weather|temperature|rain|recipe|cook|restaurant|movie|film|netflix|music|song|celebrity|gossip|travel itinerary|flight status|game walkthrough)\b/i;
 const COMPARATIVE_QUERY_PATTERN =
-  /\b(compare|comparison|versus|vs\.?|difference|different|best|better|worst|higher|highest|lower|lowest|shortest|longest|rank|ranking|top|breakeven|break even|which product)\b/i;
+  /\b(compare|comparison|versus|vs\.?|difference|different|differ|best|better|worst|higher|highest|lower|lowest|shortest|longest|rank|ranking|breakeven|break even|which product|pros and cons|advantages?\s+(?:of|over|and)|disadvantages?\s+(?:of|over|and)|recommend\s+(?:between|among)|between .{1,60} and )\b/i;
 
 function shouldBypassRewriteModel(
   queryText: string,
@@ -157,6 +157,9 @@ function shouldBypassRewriteModel(
 
   const wordCount = normalized.split(/\s+/).filter(Boolean).length;
   if (wordCount <= 3) return false;
+  const questionMarkCount = (normalized.match(/\?/g) || []).length;
+  if (questionMarkCount > 1) return false;  // multi-question → rewrite for focused embedding
+  if (wordCount > 18) return false;          // complex long query → rewrite for focused embedding
   if (normalized.length > 220) return false;
 
   return true;
@@ -320,9 +323,14 @@ async function rerankChunks(
 ): Promise<RetrievedChunk[]> {
   if (chunks.length <= 3) return chunks; // Not worth reranking small sets
 
+  // Cap chunks sent to reranker to keep it fast and reliable
+  const MAX_RERANK_CHUNKS = 20;
+  const toRerank = chunks.slice(0, MAX_RERANK_CHUNKS);
+  const overflow = chunks.slice(MAX_RERANK_CHUNKS);
+
   try {
     // Truncate chunk text to keep the reranking call fast and cheap
-    const chunkPreviews = chunks.map((c, i) =>
+    const chunkPreviews = toRerank.map((c, i) =>
       `[${i + 1}] ${c.text.slice(0, 300)}`
     ).join('\n');
 
@@ -342,7 +350,7 @@ async function rerankChunks(
         },
       ],
       temperature: 0,
-      max_tokens: 80,
+      max_tokens: Math.max(80, toRerank.length * 6),
     });
 
     const raw = completion.choices[0].message.content?.trim();
@@ -352,20 +360,20 @@ async function rerankChunks(
     const cleaned = raw.replace(/^```json?\s*/i, '').replace(/\s*```$/i, '');
     const scores: number[] = JSON.parse(cleaned);
 
-    if (!Array.isArray(scores) || scores.length !== chunks.length) {
-      console.warn(`[RERANK] score count mismatch: got ${scores.length}, expected ${chunks.length}`);
+    if (!Array.isArray(scores) || scores.length !== toRerank.length) {
+      console.warn(`[RERANK] score count mismatch: got ${scores.length}, expected ${toRerank.length}`);
       return chunks;
     }
 
     // Pair chunks with rerank scores and sort descending
-    const paired = chunks.map((chunk, i) => ({
+    const paired = toRerank.map((chunk, i) => ({
       chunk,
       rerankScore: typeof scores[i] === 'number' ? scores[i] : 0,
     }));
     paired.sort((a, b) => b.rerankScore - a.rerankScore);
 
     console.log(`[RERANK] scores=${scores.join(',')} reordered=${paired.map(p => p.rerankScore).join(',')}`);
-    return paired.map(p => p.chunk);
+    return [...paired.map(p => p.chunk), ...overflow];
   } catch (err: any) {
     console.warn(`[RERANK] failed, using original order: ${err.message}`);
     return chunks; // Fallback to original similarity ordering
@@ -576,7 +584,7 @@ export async function retrieveContextForQuery(params: {
 
   // Page-expansion: fetch all chunks from a capped set of high-confidence pages.
   // This keeps table/list reconstruction while reducing latency and context size.
-  const expansionMinSimilarity = comparativeQuery ? 0.40 : 0.50;
+  const expansionMinSimilarity = comparativeQuery ? 0.40 : 0.43;
   const vectorMatchedChunks = chunks.filter((c) => c.similarity >= expansionMinSimilarity);
   const maxVectorMatchesForExpansion = comparativeQuery
     ? Math.max(ragConfig.maxVectorMatchesForExpansion, 10)

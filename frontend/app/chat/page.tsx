@@ -43,6 +43,7 @@ interface Message {
     similarity: number;
     document_id?: string;
     text?: string;
+    ref?: number;
   }>;
   created_at: string;
 }
@@ -71,61 +72,30 @@ function preserveLineBreaks(text: string): string {
 
 function processCitations(
   response: string,
-  sources: Array<{ page: number; document_id?: string; similarity?: number }>,
+  sources: Array<{
+    page: number;
+    document_id?: string;
+    similarity?: number;
+    ref?: number;
+  }>,
 ): string {
-  const pageToBestSource = new Map<
-    number,
-    { document_id: string; similarity: number }
-  >();
-
+  // Build lookup: ref number -> source with document_id
+  const refToSource = new Map<number, { document_id: string; page: number }>();
   for (const s of sources) {
-    if (!s.document_id) continue;
-    const similarity = typeof s.similarity === "number" ? s.similarity : 0;
-    const existing = pageToBestSource.get(s.page);
-    if (!existing || similarity > existing.similarity) {
-      pageToBestSource.set(s.page, { document_id: s.document_id, similarity });
+    if (s.ref != null && s.document_id) {
+      refToSource.set(s.ref, { document_id: s.document_id, page: s.page });
     }
   }
 
-  const parsePages = (citationBlock: string): number[] => {
-    const content = citationBlock.slice(1, -1).replace(/^p\./i, "");
-    const segments = content
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const pages: number[] = [];
-
-    for (const segment of segments) {
-      const normalized = segment.replace(/^p\./i, "").trim();
-      const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
-      if (rangeMatch) {
-        const start = parseInt(rangeMatch[1], 10);
-        const end = parseInt(rangeMatch[2], 10);
-        for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
-          pages.push(i);
-        }
-        continue;
-      }
-
-      const page = parseInt(normalized, 10);
-      if (!Number.isNaN(page)) pages.push(page);
+  // Replace [N] citations with clickable links
+  return response.replace(/\[(\d+)\]/g, (match, numStr: string) => {
+    const refNum = parseInt(numStr, 10);
+    const mapped = refToSource.get(refNum);
+    if (mapped) {
+      return `[\[${refNum}\]](cite:${mapped.document_id}:${mapped.page})`;
     }
-
-    return pages;
-  };
-
-  return response.replace(/\[p\.[^\]]+\]/gi, (match) => {
-    const pages = parsePages(match);
-    if (pages.length === 0) return match;
-
-    return pages
-      .map((page) => {
-        const mapped = pageToBestSource.get(page);
-        return mapped
-          ? `[p.${page}](cite:${mapped.document_id}:${page})`
-          : `[p.${page}](cite-nolink:${page})`;
-      })
-      .join(", ");
+    // No source for this ref — render as plain text
+    return match;
   });
 }
 
@@ -184,7 +154,9 @@ function NewSessionModal({
   return (
     <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/60'>
       <div className='bg-[#1F1F1F] rounded-2xl shadow-xl w-full max-w-sm mx-4 p-6 border border-[#2B2B2B]'>
-        <h2 className='text-lg font-semibold font-heading text-white mb-4'>New Chat</h2>
+        <h2 className='text-lg font-semibold font-heading text-white mb-4'>
+          New Chat
+        </h2>
 
         {/* Mode toggle */}
         <p className='text-sm text-gray-400 mb-2'>Mode</p>
@@ -231,9 +203,7 @@ function NewSessionModal({
           autoFocus
         />
 
-        {error && (
-          <p className='text-xs text-red-400 mb-3'>{error}</p>
-        )}
+        {error && <p className='text-xs text-red-400 mb-3'>{error}</p>}
 
         <div className='flex gap-3'>
           <button
@@ -772,14 +742,6 @@ export default function ChatPage() {
                                   </button>
                                 );
                               }
-                              if (href?.startsWith("cite-nolink:")) {
-                                return (
-                                  <span className='inline-flex items-center gap-0.5 bg-[#2B2B2B] border border-[#3a3a3a] rounded px-1.5 py-0.5 text-xs text-gray-400 font-medium mx-0.5 align-middle not-prose'>
-                                    <FileText className='w-3 h-3' />
-                                    {children}
-                                  </span>
-                                );
-                              }
                               return (
                                 <a
                                   href={href}
@@ -813,6 +775,11 @@ export default function ChatPage() {
                                 className='inline-flex items-center gap-1.5 bg-[#2B2B2B] border border-[#3a3a3a] rounded-md px-2.5 py-1 text-xs text-gray-300 hover:bg-[#333] hover:border-gold/30 disabled:cursor-default disabled:hover:bg-[#2B2B2B] disabled:hover:border-[#3a3a3a] transition-colors'
                               >
                                 <FileText className='w-3 h-3 shrink-0 text-gray-500' />
+                                {source.ref != null && (
+                                  <span className='text-gold font-semibold'>
+                                    [{source.ref}]
+                                  </span>
+                                )}
                                 <span className='font-medium'>
                                   {source.filename}
                                 </span>

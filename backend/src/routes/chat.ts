@@ -6,7 +6,7 @@ import { supabase } from '../lib/supabase';
 import { chatLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
-import { buildSystemPrompt } from '../services/promptBuilder';
+import { buildSystemPrompt, buildNumberedContext, ReferenceEntry } from '../services/promptBuilder';
 import { ragConfig } from '../services/ragConfig';
 
 const router = Router();
@@ -14,6 +14,55 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const NO_DIRECT_DOC_ANSWER_REGEX = /(does not explicitly|not explicitly|not specified|cannot be determined from the document|document does not (?:state|specify|provide))/i;
 const LOW_RELEVANCE_NOTE = 'The documents do not explicitly provide a direct answer; this is the closest guidance from related sections.';
+
+// ============================================================================
+// Citation highlight helpers
+// ============================================================================
+
+const HIGHLIGHT_STOP_WORDS = new Set([
+  'that', 'this', 'with', 'from', 'they', 'will', 'have', 'been',
+  'their', 'there', 'which', 'where', 'when', 'what', 'clients',
+  'client', 'must', 'only', 'able', 'also', 'does', 'are',
+  'not', 'for', 'the', 'and', 'can', 'per',
+]);
+
+/**
+ * Extract significant keywords from the answer sentences that cite a specific [N] reference.
+ * These words are used as hints to locate the relevant section within the chunk text.
+ */
+function extractHintWordsForRef(answer: string, refNum: number): string[] {
+  const segments = answer.split(/\n+/);
+  const cited = segments.filter((s) => s.includes(`[${refNum}]`));
+  const text = cited.join(' ').toLowerCase();
+  const words = text.match(/\b\w{4,}\b/g) ?? [];
+  return [...new Set(words.filter((w) => !HIGHLIGHT_STOP_WORDS.has(w)))];
+}
+
+/**
+ * Given a chunk text and hint words derived from the cited answer, find the line
+ * with the highest hint-word density and return the text from that line onwards
+ * (capped at ~500 chars). This shifts the PDF highlight anchor from the top of a
+ * multi-section chunk to the specific section the LLM actually cited.
+ */
+function extractFocusedSnippet(chunkText: string, hintWords: string[]): string {
+  if (hintWords.length === 0 || chunkText.length <= 400) return chunkText;
+
+  const lines = chunkText.split('\n');
+  let bestLine = 0;
+  let bestScore = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineLower = lines[i].toLowerCase();
+    const score = hintWords.filter((w) => lineLower.includes(w)).length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestLine = i;
+    }
+  }
+
+  if (bestScore === 0) return chunkText;
+  return lines.slice(bestLine).join('\n').slice(0, 500);
+}
 
 function isNoDirectAnswerInDocs(answer: string): boolean {
   return NO_DIRECT_DOC_ANSWER_REGEX.test(answer);
@@ -24,112 +73,31 @@ function prependLowRelevanceNote(answer: string): string {
   return `${LOW_RELEVANCE_NOTE}\n\n${answer}`;
 }
 
-function extractContextPages(context: string): number[] {
-  const pages = new Set<number>();
-  const headerRegex = /\[[^\]]+,\s*Page\s+(\d+)\]/gi;
-  let match: RegExpExecArray | null;
-  while ((match = headerRegex.exec(context)) !== null) {
-    const page = Number.parseInt(match[1], 10);
-    if (!Number.isNaN(page)) {
-      pages.add(page);
-    }
+// --- Numbered reference citation helpers ---
+
+/** Extract all [N] citation numbers from an answer string. */
+function extractCitedRefs(answer: string): number[] {
+  const refs = new Set<number>();
+  const matches = answer.match(/\[(\d+)\]/g) || [];
+  for (const m of matches) {
+    const n = parseInt(m.slice(1, -1), 10);
+    if (!Number.isNaN(n)) refs.add(n);
   }
-  return Array.from(pages).sort((a, b) => a - b);
+  return Array.from(refs).sort((a, b) => a - b);
 }
 
-function parseCitationPages(token: string): number[] {
-  const pages = new Set<number>();
-  const content = token.slice(1, -1).replace(/^p\./i, '');
-  const segments = content.split(',').map((s) => s.trim()).filter(Boolean);
-
-  for (const segment of segments) {
-    const normalized = segment.replace(/^p\./i, '').trim();
-    const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
-    if (rangeMatch) {
-      const start = Number.parseInt(rangeMatch[1], 10);
-      const end = Number.parseInt(rangeMatch[2], 10);
-      for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
-        pages.add(i);
-      }
-      continue;
-    }
-
-    const page = Number.parseInt(normalized, 10);
-    if (!Number.isNaN(page)) {
-      pages.add(page);
-    }
-  }
-
-  return Array.from(pages).sort((a, b) => a - b);
-}
-
-function toCitationSegments(pages: number[]): string[] {
-  if (pages.length === 0) return [];
-  const segments: string[] = [];
-  let start = pages[0];
-  let prev = pages[0];
-
-  for (let i = 1; i < pages.length; i++) {
-    const current = pages[i];
-    if (current === prev + 1) {
-      prev = current;
-      continue;
-    }
-    segments.push(start === prev ? `${start}` : `${start}-${prev}`);
-    start = current;
-    prev = current;
-  }
-
-  segments.push(start === prev ? `${start}` : `${start}-${prev}`);
-  return segments;
-}
-
-function sanitizeCitationsToAllowedPages(answer: string, allowedPages: number[]): string {
-  const allowed = new Set<number>(allowedPages);
-  if (allowed.size === 0) return answer;
+/** Remove citations that reference numbers not in the allowed reference map. */
+function sanitizeCitationsToAllowedRefs(answer: string, allowedRefs: Set<number>): string {
+  if (allowedRefs.size === 0) return answer;
 
   return answer
-    .replace(/\[p\.[^\]]+\]/gi, (token) => {
-      const pages = parseCitationPages(token).filter((page) => allowed.has(page));
-      if (pages.length === 0) return '';
-      const segments = toCitationSegments(pages);
-      return `[p.${segments.join(',')}]`;
+    .replace(/\[(\d+)\]/g, (token, numStr: string) => {
+      const n = parseInt(numStr, 10);
+      return allowedRefs.has(n) ? token : '';
     })
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/ +\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n');
-}
-
-// Extract page numbers from inline citations in the answer.
-// Supports: [p.4], [p.4-5], [p.4-5, p.46], [p.4,5,6]
-function extractCitedPages(answer: string): number[] {
-  const pages = new Set<number>();
-  const bracketCitations = answer.match(/\[p\.[^\]]+\]/gi) || [];
-
-  bracketCitations.forEach((match) => {
-    const content = match.slice(1, -1).replace(/^p\./i, '');
-    const segments = content.split(',').map((s) => s.trim()).filter(Boolean);
-
-    for (const segment of segments) {
-      const normalized = segment.replace(/^p\./i, '').trim();
-      const rangeMatch = normalized.match(/^(\d+)\s*-\s*(\d+)$/);
-      if (rangeMatch) {
-        const start = parseInt(rangeMatch[1], 10);
-        const end = parseInt(rangeMatch[2], 10);
-        for (let i = Math.min(start, end); i <= Math.max(start, end); i++) {
-          pages.add(i);
-        }
-        continue;
-      }
-
-      const page = parseInt(normalized, 10);
-      if (!Number.isNaN(page)) {
-        pages.add(page);
-      }
-    }
-  });
-
-  return Array.from(pages).sort((a, b) => a - b);
 }
 
 function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
@@ -143,9 +111,6 @@ function getMaxVectorSimilarity(chunks: Array<{ similarity: number }>): number {
 /**
  * Strip leading page-header boilerplate from chunk text so the viewer can
  * match it against the PDF text layer.
- * Headers follow the pattern: <product name>\n<subtitle>\n<N | Page>\n<date line>\n<content>
- * We drop everything up to and including the "N | Page" line, plus any
- * immediately-following blank or "Information accurate" lines.
  */
 function stripChunkHeader(text: string): string {
   if (!text) return text;
@@ -164,51 +129,101 @@ function stripChunkHeader(text: string): string {
   return lines.slice(startIdx).join('\n').trim() || text;
 }
 
-function resolveSourcesForCitations(
+/**
+ * Given the reference map and the retrieved chunks, resolve cited references
+ * to full source objects. Each reference maps directly to a specific
+ * document_id + page via the reference map — no ambiguity.
+ */
+function resolveSourcesForRefs(
+  referenceMap: ReferenceEntry[],
   chunks: Array<{ filename: string; page_number: number; similarity: number; document_id: string; text?: string }>,
-  citedPages: number[],
+  citedRefs: number[],
+  answerText?: string,
 ): ChatSource[] {
-  if (citedPages.length === 0) return [];
+  if (citedRefs.length === 0) return [];
 
-  const bestByPage = new Map<number, ChatSource>();
+  // Build lookup: refNum -> ReferenceEntry
+  const refLookup = new Map<number, ReferenceEntry>();
+  for (const entry of referenceMap) {
+    refLookup.set(entry.refNum, entry);
+  }
 
+  // Build lookup: "docId:page" -> best chunk (for text + similarity)
+  const chunkByDocPage = new Map<string, { similarity: number; text?: string; document_id: string }>();
   for (const chunk of chunks) {
-    const existing = bestByPage.get(chunk.page_number);
+    const key = `${chunk.document_id}:${chunk.page_number}`;
+    const existing = chunkByDocPage.get(key);
     if (!existing || chunk.similarity > existing.similarity) {
-      bestByPage.set(chunk.page_number, {
-        filename: chunk.filename,
-        page: chunk.page_number,
+      chunkByDocPage.set(key, {
         similarity: chunk.similarity,
-        document_id: chunk.document_id,
         text: chunk.text ? stripChunkHeader(chunk.text) : chunk.text,
+        document_id: chunk.document_id,
       });
     }
   }
 
+  // For each cited ref, find the matching chunk via filename+page
   const resolved: ChatSource[] = [];
-  const seen = new Set<string>();
+  const seen = new Set<number>();
 
-  for (const page of citedPages) {
-    const source = bestByPage.get(page);
-    if (!source) continue;
+  for (const refNum of citedRefs) {
+    if (seen.has(refNum)) continue;
+    seen.add(refNum);
 
-    const key = `${source.document_id}:${page}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    resolved.push({
-      ...source,
-      similarity: Math.round(source.similarity * 100) / 100,
-    });
+    const refEntry = refLookup.get(refNum);
+    if (!refEntry) continue;
+
+    // Find chunk matching this filename+page
+    let bestMatch: { similarity: number; text?: string; document_id: string } | undefined;
+    for (const [, chunk] of chunkByDocPage) {
+      // Match by document_id + page_number
+      const chunkKey = `${chunk.document_id}:${refEntry.page}`;
+      const stored = chunkByDocPage.get(chunkKey);
+      if (stored) {
+        bestMatch = stored;
+        break;
+      }
+    }
+
+    // Fallback: search chunks by filename + page
+    if (!bestMatch) {
+      for (const chunk of chunks) {
+        if (chunk.filename === refEntry.filename && chunk.page_number === refEntry.page) {
+          bestMatch = {
+            similarity: chunk.similarity,
+            text: chunk.text ? stripChunkHeader(chunk.text) : chunk.text,
+            document_id: chunk.document_id,
+          };
+          break;
+        }
+      }
+    }
+
+    if (bestMatch) {
+      const highlightText = (() => {
+        if (!bestMatch.text || !answerText) return bestMatch.text;
+        const hintWords = extractHintWordsForRef(answerText, refNum);
+        return extractFocusedSnippet(bestMatch.text, hintWords);
+      })();
+      resolved.push({
+        ref: refNum,
+        filename: refEntry.filename,
+        page: refEntry.page,
+        similarity: Math.round(bestMatch.similarity * 100) / 100,
+        document_id: bestMatch.document_id,
+        text: highlightText,
+      });
+    }
   }
 
   return resolved;
 }
 
-// Bold page citations in the answer
+// Bold numbered citations in the answer
 function boldCitations(answer: string): string {
-  // Ensure space between adjacent citations to prevent **** (e.g. [p.13][p.46] → [p.13] [p.46])
-  const spaced = answer.replace(/\]\s*\[p\./g, '] [p.');
-  return spaced.replace(/\[p\.(\d+(?:-\d+)?)\]/g, '**[p.$1]**');
+  // Ensure space between adjacent citations
+  const spaced = answer.replace(/\]\s*\[(\d)/g, '] [$1');
+  return spaced.replace(/\[(\d+)\]/g, '**[$1]**');
 }
 
 // Format answer spacing for readability
@@ -254,20 +269,21 @@ function formatAnswer(answer: string): string {
   return formatted;
 }
 
-type ChatSource = { filename: string; page: number; similarity: number; document_id: string; text?: string };
+type ChatSource = { ref?: number; filename: string; page: number; similarity: number; document_id: string; text?: string };
 
 function finalizeChatAnswer(params: {
   answer: string;
   domainInDomain: boolean;
   usedWebFallback: boolean;
   retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null;
+  referenceMap?: ReferenceEntry[];
 }): {
   processedAnswer: string;
   filteredSources: ChatSource[];
   analyticsOutcome: string;
   citationMappingMs: number;
 } {
-  const { answer, domainInDomain, usedWebFallback, retrieval } = params;
+  const { answer, domainInDomain, usedWebFallback, retrieval, referenceMap } = params;
 
   if (usedWebFallback) {
     return {
@@ -283,16 +299,23 @@ function finalizeChatAnswer(params: {
   const lowRelevance = maxVectorSimilarity < ragConfig.minSourceSimilarity;
   const noDirectAnswer = isNoDirectAnswerInDocs(answer);
   const shouldCountAsNoDirect = noDirectAnswer || lowRelevance;
-  const contextPages = extractContextPages(retrieval?.context ?? '');
 
   const answerWithNote = lowRelevance ? prependLowRelevanceNote(answer) : answer;
-  const sanitizedAnswer = sanitizeCitationsToAllowedPages(answerWithNote, contextPages);
-  const citedPages = extractCitedPages(sanitizedAnswer);
+
+  // Sanitize to only allow citation reference numbers that exist in the reference map
+  const allowedRefs = new Set<number>((referenceMap ?? []).map((r) => r.refNum));
+  const sanitizedAnswer = sanitizeCitationsToAllowedRefs(answerWithNote, allowedRefs);
+  const citedRefs = extractCitedRefs(sanitizedAnswer);
 
   let processedAnswer = boldCitations(sanitizedAnswer);
   processedAnswer = formatAnswer(processedAnswer);
 
-  const filteredSources = resolveSourcesForCitations(retrieval?.chunks ?? [], citedPages);
+  const filteredSources = resolveSourcesForRefs(
+    referenceMap ?? [],
+    retrieval?.chunks ?? [],
+    citedRefs,
+    answer,
+  );
   const analyticsOutcome = shouldCountAsNoDirect ? 'no_direct_answer_in_docs' : 'success';
 
   return {
@@ -493,9 +516,9 @@ router.post(
       retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat', conversationHistory });
       timings.retrieval_ms = elapsedMs(retrievalStart);
       const noChunks = !retrieval.context;
-      if (noChunks) {
+      if (noChunks || !domain.in_domain) {
         usedWebFallback = true;
-        console.log(`[RAG][chat] no_chunks_found query="${queryText}" in_domain=${domain.in_domain} reason="${domain.reason}"`);
+        console.log(`[RAG][chat] ${noChunks ? 'no_chunks_found' : 'out_of_domain_fallback'} query="${queryText}" in_domain=${domain.in_domain} reason="${domain.reason}"`);
       } else {
         console.log(`[RAG][chat] context_length=${retrieval.context.length} sources=${retrieval.sources.length} usedWebFallback=${usedWebFallback}`);
         console.log(`[RAG][chat] context_preview="${retrieval.context.substring(0, 500)}..."`);
@@ -503,10 +526,12 @@ router.post(
 
       // 3. Build system prompt using unified builder (same for web and Telegram)
       const promptBuildStart = Date.now();
+      const { numberedContext, referenceMap } = buildNumberedContext(retrieval?.context || '');
       const systemPrompt = buildSystemPrompt(
-        retrieval?.context || '',
+        numberedContext,
         session.mode as 'client' | 'learner',
         usedWebFallback,
+        referenceMap,
       );
       timings.prompt_build_ms = elapsedMs(promptBuildStart);
 
@@ -537,6 +562,7 @@ router.post(
         domainInDomain: domain.in_domain,
         usedWebFallback,
         retrieval,
+        referenceMap,
       });
       const processedAnswer = finalized.processedAnswer;
       const filteredSources = finalized.filteredSources;
@@ -713,19 +739,21 @@ router.post(
       retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat', conversationHistory });
       timings.retrieval_ms = elapsedMs(retrievalStart);
       const noChunks = !retrieval.context;
-      if (noChunks) {
+      if (noChunks || !domain.in_domain) {
         usedWebFallback = true;
-        console.log(`[RAG][chat] no_chunks_found query="${queryText}" in_domain=${domain.in_domain} reason="${domain.reason}"`);
+        console.log(`[RAG][chat] ${noChunks ? 'no_chunks_found' : 'out_of_domain_fallback'} query="${queryText}" in_domain=${domain.in_domain} reason="${domain.reason}"`);
       } else {
         console.log(`[RAG][chat] context_length=${retrieval.context.length} sources=${retrieval.sources.length} usedWebFallback=${usedWebFallback}`);
         console.log(`[RAG][chat] context_preview="${retrieval.context.substring(0, 500)}..."`);
       }
 
       const promptBuildStart = Date.now();
+      const { numberedContext: streamNumberedContext, referenceMap: streamReferenceMap } = buildNumberedContext(retrieval?.context || '');
       const systemPrompt = buildSystemPrompt(
-        retrieval?.context || '',
+        streamNumberedContext,
         session.mode as 'client' | 'learner',
         usedWebFallback,
+        streamReferenceMap,
       );
       timings.prompt_build_ms = elapsedMs(promptBuildStart);
 
@@ -767,6 +795,7 @@ router.post(
         domainInDomain: domain.in_domain,
         usedWebFallback,
         retrieval,
+        referenceMap: streamReferenceMap,
       });
       const processedAnswer = finalized.processedAnswer;
       const filteredSources = finalized.filteredSources;

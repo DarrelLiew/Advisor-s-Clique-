@@ -312,7 +312,7 @@ export async function processDocument(documentId: string, filePath: string): Pro
     for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
       const page = pages[pageIdx];
       const pageImage = pageImages[pageIdx] || null;
-      console.log(`Processing page ${pageIdx + 1}/${pages.length}...`);
+      console.log(`Processing page ${pageIdx + 1}/${pages.length}${pageImage ? ' (with image)' : ''}...`);
 
       // Separate tables from prose via hybrid pipeline
       const { nonTableText, tableChunks } = await processPageTables(

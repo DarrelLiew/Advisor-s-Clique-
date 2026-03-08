@@ -26,7 +26,11 @@ export default function DocumentsPage() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [uploading, setUploading] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [pageMessage, setPageMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [pageMessage, setPageMessage] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
   const router = useRouter();
 
   useEffect(() => {
@@ -38,14 +42,18 @@ export default function DocumentsPage() {
 
   const loadDocuments = async () => {
     try {
-      const data = await api.get<{ documents: Document[] }>("/api/admin/documents");
+      const data = await api.get<{ documents: Document[] }>(
+        "/api/admin/documents",
+      );
       setDocuments(data.documents || []);
+      setLoadError(null);
     } catch (error) {
       if (error instanceof SessionExpiredError) {
         router.push("/login");
         return;
       }
       console.error("Failed to load documents:", error);
+      setLoadError((error as Error).message || "Failed to connect to server");
       setDocuments([]);
     } finally {
       setLoading(false);
@@ -62,7 +70,10 @@ export default function DocumentsPage() {
     }
 
     if (file.size > 100 * 1024 * 1024) {
-      setPageMessage({ type: "error", text: "File size must be less than 100MB." });
+      setPageMessage({
+        type: "error",
+        text: "File size must be less than 100MB.",
+      });
       return;
     }
 
@@ -100,7 +111,10 @@ export default function DocumentsPage() {
         return;
       }
       console.error("Upload error:", error);
-      setPageMessage({ type: "error", text: error.message || "Failed to upload document." });
+      setPageMessage({
+        type: "error",
+        text: error.message || "Failed to upload document.",
+      });
     } finally {
       setUploading(false);
     }
@@ -123,19 +137,30 @@ export default function DocumentsPage() {
   };
 
   const handleReprocess = async (id: string) => {
-    if (!confirm("Re-process this document? Existing chunks will be deleted and re-embedded with the current chunk settings.")) return;
+    if (
+      !confirm(
+        "Re-process this document? Existing chunks will be deleted and re-embedded with the current chunk settings.",
+      )
+    )
+      return;
 
     try {
       await api.post(`/api/admin/documents/${id}/reprocess`, {});
       await loadDocuments();
-      setPageMessage({ type: "success", text: "Reprocessing started — status will update automatically." });
+      setPageMessage({
+        type: "success",
+        text: "Reprocessing started — status will update automatically.",
+      });
     } catch (error: any) {
       if (error instanceof SessionExpiredError) {
         router.push("/login");
         return;
       }
       console.error("Reprocess error:", error);
-      setPageMessage({ type: "error", text: error.message || "Failed to start reprocessing." });
+      setPageMessage({
+        type: "error",
+        text: error.message || "Failed to start reprocessing.",
+      });
     }
   };
 
@@ -200,6 +225,23 @@ export default function DocumentsPage() {
           <div className='p-12 text-center text-gray-500'>
             Loading documents...
           </div>
+        ) : loadError ? (
+          <div className='p-12 text-center'>
+            <XCircle className='w-12 h-12 mx-auto mb-3 text-red-300' />
+            <p className='text-red-600 font-medium mb-1'>
+              Failed to load documents
+            </p>
+            <p className='text-gray-500 text-sm'>{loadError}</p>
+            <button
+              onClick={() => {
+                setLoading(true);
+                loadDocuments();
+              }}
+              className='mt-3 px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded text-sm text-gray-700 transition-colors'
+            >
+              Retry
+            </button>
+          </div>
         ) : documents.length === 0 ? (
           <div className='p-12 text-center text-gray-500'>
             <FileText className='w-12 h-12 mx-auto mb-3 opacity-20' />
@@ -256,7 +298,7 @@ export default function DocumentsPage() {
                   </td>
                   <td className='px-6 py-4 text-right'>
                     <div className='flex items-center justify-end gap-3'>
-                      {doc.processing_status === 'ready' && (
+                      {doc.processing_status === "ready" && (
                         <button
                           onClick={() => handleReprocess(doc.id)}
                           title='Re-process with current chunk settings'

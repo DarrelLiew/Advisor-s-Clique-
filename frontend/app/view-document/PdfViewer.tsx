@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/TextLayer.css";
 import "react-pdf/dist/Page/AnnotationLayer.css";
@@ -11,14 +11,70 @@ pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
 // Common words that carry little discriminating signal — excluded from
 // bag-of-words matching so noise doesn't inflate overlap scores.
 const STOP_WORDS = new Set([
-  "that", "this", "with", "from", "they", "been", "have", "were", "will",
-  "your", "their", "which", "when", "also", "each", "more", "than", "then",
-  "into", "over", "such", "upon", "under", "after", "before", "during",
-  "about", "against", "between", "through", "shall", "would", "could",
-  "should", "these", "those", "there", "where", "while", "other", "some",
-  "make", "made", "only", "both", "must", "does", "done", "used", "been",
-  "were", "paid", "pays", "paid", "plus", "less", "date", "time", "year",
-  "note", "term", "plan", "base", "back",
+  "that",
+  "this",
+  "with",
+  "from",
+  "they",
+  "been",
+  "have",
+  "were",
+  "will",
+  "your",
+  "their",
+  "which",
+  "when",
+  "also",
+  "each",
+  "more",
+  "than",
+  "then",
+  "into",
+  "over",
+  "such",
+  "upon",
+  "under",
+  "after",
+  "before",
+  "during",
+  "about",
+  "against",
+  "between",
+  "through",
+  "shall",
+  "would",
+  "could",
+  "should",
+  "these",
+  "those",
+  "there",
+  "where",
+  "while",
+  "other",
+  "some",
+  "make",
+  "made",
+  "only",
+  "both",
+  "must",
+  "does",
+  "done",
+  "used",
+  "been",
+  "were",
+  "paid",
+  "pays",
+  "paid",
+  "plus",
+  "less",
+  "date",
+  "time",
+  "year",
+  "note",
+  "term",
+  "plan",
+  "base",
+  "back",
 ]);
 
 /** Words worth matching: long enough and not a stop word. */
@@ -50,6 +106,13 @@ function normalize(s: string): string {
     .toLowerCase();
 }
 
+// Zoom constants
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 3.0;
+const SCALE_STEP = 0.15;
+const VIRTUALIZATION_BUFFER = 3; // pages above/below viewport to render
+const ESTIMATED_PAGE_HEIGHT = 1100; // default height estimate for unrendered pages
+
 interface Props {
   url: string;
   initialPage: number;
@@ -67,11 +130,19 @@ export default function PdfViewer({
   const [highlightText, setHighlightText] = useState<string | null>(null);
   const [containerWidth, setContainerWidth] = useState<number>(800);
   const [jumpToPage, setJumpToPage] = useState<string>(String(initialPage));
+  const [scale, setScale] = useState<number>(0.55);
+  const [visibleRange, setVisibleRange] = useState<{
+    start: number;
+    end: number;
+  }>({ start: 1, end: 10 });
 
   const containerRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const pageHeights = useRef<Map<number, number>>(new Map());
   const highlightMapRef = useRef<Set<number> | null>(null);
   const scrolledRef = useRef(false);
+  const isScaleChanging = useRef(false);
+  const initialLoadRef = useRef(true);
 
   // Read highlight text from localStorage (web flow) or use URL param (Telegram flow)
   useEffect(() => {
@@ -88,11 +159,12 @@ export default function PdfViewer({
     }
   }, [highlightKey, highlightTextProp]);
 
-  // Responsive width via ResizeObserver
+  // Responsive width via ResizeObserver — only update if not a zoom-triggered resize
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
     const ro = new ResizeObserver((entries) => {
+      if (isScaleChanging.current) return;
       const w = entries[0]?.contentRect.width;
       if (w) setContainerWidth(w);
     });
@@ -107,11 +179,106 @@ export default function PdfViewer({
     [],
   );
 
+  // Compute which page is currently visible based on scroll position
+  const getCurrentPage = useCallback((): number => {
+    const container = containerRef.current;
+    if (!container || !numPages) return initialPage;
+    const scrollTop = container.scrollTop;
+    const containerHeight = container.clientHeight;
+    const viewMid = scrollTop + containerHeight / 3;
+    let accHeight = 0;
+    for (let pg = 1; pg <= numPages; pg++) {
+      const h = pageHeights.current.get(pg) ?? ESTIMATED_PAGE_HEIGHT * scale;
+      accHeight += h + 8; // 8px margin
+      if (accHeight > viewMid) return pg;
+    }
+    return numPages;
+  }, [numPages, scale, initialPage]);
+
+  // Update visible range on scroll for virtualization
+  const updateVisibleRange = useCallback(() => {
+    if (!numPages) return;
+    const currentPg = getCurrentPage();
+    const start = Math.max(1, currentPg - VIRTUALIZATION_BUFFER);
+    const end = Math.min(numPages, currentPg + VIRTUALIZATION_BUFFER);
+    setVisibleRange((prev) => {
+      if (prev.start === start && prev.end === end) return prev;
+      return { start, end };
+    });
+  }, [numPages, getCurrentPage]);
+
+  // Scroll event handler for virtualization
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    let ticking = false;
+    const onScroll = () => {
+      if (!ticking) {
+        ticking = true;
+        requestAnimationFrame(() => {
+          updateVisibleRange();
+          ticking = false;
+        });
+      }
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => el.removeEventListener("scroll", onScroll);
+  }, [updateVisibleRange]);
+
+  // Ctrl+Wheel zoom handler
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? -SCALE_STEP : SCALE_STEP;
+      setScale(
+        (prev) =>
+          Math.round(
+            Math.min(MAX_SCALE, Math.max(MIN_SCALE, prev + delta)) * 100,
+          ) / 100,
+      );
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // When scale changes, preserve scroll position (skip on initial document load)
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !numPages) return;
+
+    if (initialLoadRef.current) {
+      initialLoadRef.current = false;
+      return;
+    }
+
+    isScaleChanging.current = true;
+    const currentPg = getCurrentPage();
+
+    // After React re-renders with new scale, scroll back to the same page
+    requestAnimationFrame(() => {
+      const el = pageRefs.current.get(currentPg);
+      if (el) {
+        el.scrollIntoView({ behavior: "auto", block: "start" });
+      }
+      // Update visible range after scale change
+      updateVisibleRange();
+      isScaleChanging.current = false;
+    });
+  }, [scale, numPages, getCurrentPage, updateVisibleRange]);
+
   // Scroll to the initial page once document loads
   useEffect(() => {
     if (numPages === null || scrolledRef.current) return;
-    // Small delay to allow pages to start rendering
+    // Set initial visible range to include the target page
+    const start = Math.max(1, initialPage - VIRTUALIZATION_BUFFER);
+    const end = Math.min(numPages, initialPage + VIRTUALIZATION_BUFFER);
+    setVisibleRange({ start, end });
+
     const timer = setTimeout(() => {
+      if (scrolledRef.current) return; // mark-based scroll already positioned correctly
       const el = pageRefs.current.get(initialPage);
       if (el) {
         el.scrollIntoView({ behavior: "auto", block: "start" });
@@ -120,12 +287,25 @@ export default function PdfViewer({
     return () => clearTimeout(timer);
   }, [numPages, initialPage]);
 
-  const scrollToPage = useCallback((page: number) => {
-    const el = pageRefs.current.get(page);
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-  }, []);
+  const scrollToPage = useCallback(
+    (page: number) => {
+      if (!numPages) return;
+      // Ensure target is in the visible range first
+      const start = Math.max(1, page - VIRTUALIZATION_BUFFER);
+      const end = Math.min(numPages, page + VIRTUALIZATION_BUFFER);
+      setVisibleRange({ start, end });
+
+      requestAnimationFrame(() => {
+        setTimeout(() => {
+          const el = pageRefs.current.get(page);
+          if (el) {
+            el.scrollIntoView({ behavior: "smooth", block: "start" });
+          }
+        }, 100);
+      });
+    },
+    [numPages],
+  );
 
   const handleJumpToPage = useCallback(
     (e: React.FormEvent) => {
@@ -137,6 +317,36 @@ export default function PdfViewer({
     },
     [jumpToPage, numPages, scrollToPage],
   );
+
+  // Zoom controls
+  const zoomIn = useCallback(() => {
+    setScale(
+      (prev) => Math.round(Math.min(MAX_SCALE, prev + SCALE_STEP) * 100) / 100,
+    );
+  }, []);
+
+  const zoomOut = useCallback(() => {
+    setScale(
+      (prev) => Math.round(Math.max(MIN_SCALE, prev - SCALE_STEP) * 100) / 100,
+    );
+  }, []);
+
+  const zoomReset = useCallback(() => {
+    setScale(1.0);
+  }, []);
+
+  const pageWidth = useMemo(
+    () => Math.max(300, (containerWidth - 32) * scale),
+    [containerWidth, scale],
+  );
+
+  // Track page heights for accurate placeholder sizing
+  const onPageRenderSuccess = useCallback((pg: number) => {
+    const el = pageRefs.current.get(pg);
+    if (el) {
+      pageHeights.current.set(pg, el.offsetHeight);
+    }
+  }, []);
 
   // Compute which text-layer items overlap with the chunk text.
   //
@@ -207,7 +417,11 @@ export default function PdfViewer({
 
       if (bestPageStart !== -1 && bestRunLen >= MIN_RUN) {
         const matched = new Set<number>();
-        for (let wi = bestPageStart; wi <= Math.min(bestPageStart + bestRunLen - 1, pageWords.length - 1); wi++) {
+        for (
+          let wi = bestPageStart;
+          wi <= Math.min(bestPageStart + bestRunLen - 1, pageWords.length - 1);
+          wi++
+        ) {
           matched.add(wordToItem[wi]);
         }
         if (matched.size > 0) {
@@ -242,7 +456,9 @@ export default function PdfViewer({
       //   • it shares ≥ 1 anchor word (number / long term) with the chunk.
       const matched = new Set<number>();
       for (let i = 0; i < items.length; i++) {
-        const iWords = sigWords(normalize(items[i].str).split(/\s+/).filter(Boolean));
+        const iWords = sigWords(
+          normalize(items[i].str).split(/\s+/).filter(Boolean),
+        );
         if (iWords.length === 0) continue;
         const hits = iWords.filter((w) => chunkSig.has(w));
         if (hits.length >= 2 || (hits.length === 1 && isAnchorWord(hits[0]))) {
@@ -273,8 +489,14 @@ export default function PdfViewer({
     requestAnimationFrame(() => {
       const mark = containerRef.current?.querySelector(".pdf-chunk-highlight");
       if (mark) {
-        mark.scrollIntoView({ behavior: "smooth", block: "center" });
+        // Use instant scroll — smooth animation drifts as other pages render and shift layout
+        mark.scrollIntoView({ behavior: "auto", block: "center" });
         scrolledRef.current = true;
+        // Re-scroll after surrounding pages finish rendering and heights stabilize
+        setTimeout(() => {
+          const m = containerRef.current?.querySelector(".pdf-chunk-highlight");
+          if (m) m.scrollIntoView({ behavior: "auto", block: "center" });
+        }, 600);
       }
     });
   }, []);
@@ -299,19 +521,21 @@ export default function PdfViewer({
         }
       `}</style>
 
-      {/* Navigation bar — jump to page */}
+      {/* Navigation & zoom toolbar */}
       <div
         style={{
           background: "#323639",
           color: "white",
           padding: "8px 16px",
           display: "flex",
-          gap: 12,
+          gap: 16,
           alignItems: "center",
           justifyContent: "center",
           flexShrink: 0,
+          flexWrap: "wrap",
         }}
       >
+        {/* Page navigation */}
         <form
           onSubmit={handleJumpToPage}
           style={{ display: "flex", gap: 8, alignItems: "center" }}
@@ -352,9 +576,72 @@ export default function PdfViewer({
             Go
           </button>
         </form>
+
+        {/* Zoom controls */}
+        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+          <button
+            onClick={zoomOut}
+            disabled={scale <= MIN_SCALE}
+            style={{
+              width: 32,
+              height: 32,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: scale <= MIN_SCALE ? "#3a3a3a" : "#555",
+              color: scale <= MIN_SCALE ? "#777" : "white",
+              border: "none",
+              borderRadius: 4,
+              cursor: scale <= MIN_SCALE ? "default" : "pointer",
+              fontSize: 18,
+              fontWeight: "bold",
+            }}
+            title='Zoom out'
+          >
+            −
+          </button>
+          <button
+            onClick={zoomReset}
+            style={{
+              padding: "4px 10px",
+              background: "#555",
+              color: "white",
+              border: "none",
+              borderRadius: 4,
+              cursor: "pointer",
+              fontSize: 13,
+              minWidth: 52,
+              textAlign: "center",
+            }}
+            title='Reset zoom'
+          >
+            {Math.round(scale * 100)}%
+          </button>
+          <button
+            onClick={zoomIn}
+            disabled={scale >= MAX_SCALE}
+            style={{
+              width: 32,
+              height: 32,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: scale >= MAX_SCALE ? "#3a3a3a" : "#555",
+              color: scale >= MAX_SCALE ? "#777" : "white",
+              border: "none",
+              borderRadius: 4,
+              cursor: scale >= MAX_SCALE ? "default" : "pointer",
+              fontSize: 18,
+              fontWeight: "bold",
+            }}
+            title='Zoom in'
+          >
+            +
+          </button>
+        </div>
       </div>
 
-      {/* PDF container — continuous scroll */}
+      {/* PDF container — continuous scroll with virtualization */}
       <div
         ref={containerRef}
         style={{
@@ -392,7 +679,37 @@ export default function PdfViewer({
           {numPages &&
             Array.from({ length: numPages }, (_, i) => {
               const pg = i + 1;
+              const isInRange =
+                pg >= visibleRange.start && pg <= visibleRange.end;
               const isHighlightPage = pg === initialPage && !!highlightText;
+
+              // Placeholder for pages outside visible range
+              if (!isInRange) {
+                const estimatedH =
+                  pageHeights.current.get(pg) ?? ESTIMATED_PAGE_HEIGHT * scale;
+                return (
+                  <div
+                    key={pg}
+                    ref={(el) => {
+                      if (el) pageRefs.current.set(pg, el);
+                    }}
+                    className='pdf-page-wrapper'
+                    style={{
+                      height: estimatedH,
+                      width: pageWidth,
+                      background: "#4a4d50",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      color: "#888",
+                      fontSize: 14,
+                    }}
+                  >
+                    Page {pg}
+                  </div>
+                );
+              }
+
               return (
                 <div
                   key={pg}
@@ -403,7 +720,7 @@ export default function PdfViewer({
                 >
                   <Page
                     pageNumber={pg}
-                    width={Math.max(300, containerWidth - 32)}
+                    width={pageWidth}
                     renderTextLayer={true}
                     renderAnnotationLayer={true}
                     customTextRenderer={
@@ -413,8 +730,11 @@ export default function PdfViewer({
                       isHighlightPage ? onGetTextSuccess : undefined
                     }
                     onRenderTextLayerSuccess={
-                      isHighlightPage ? onRenderTextLayerSuccess : undefined
+                      isHighlightPage
+                        ? onRenderTextLayerSuccess
+                        : () => onPageRenderSuccess(pg)
                     }
+                    onRenderSuccess={() => onPageRenderSuccess(pg)}
                     loading={
                       <div
                         style={{
