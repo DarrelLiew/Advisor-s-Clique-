@@ -30,6 +30,13 @@ export const ragConfig = {
   generationMaxTokensLearner: Math.max(128, parseIntEnv('RAG_GENERATION_MAX_TOKENS_LEARNER', 1000)),
   chunkSize,
   chunkOverlap,
+  // Set ENABLE_ENHANCED_ROUTING=false to disable intent router + sufficiency check and use the original pipeline.
+  enableEnhancedRouting: process.env.ENABLE_ENHANCED_ROUTING !== 'false',
+
+  // Agent mode settings
+  agentMaxIterations: Math.max(1, parseIntEnv('AGENT_MAX_ITERATIONS', 8)),
+  agentTimeoutMs: Math.max(5000, parseIntEnv('AGENT_TIMEOUT_MS', 30000)),
+  generationMaxTokensAgent: Math.max(128, parseIntEnv('RAG_GENERATION_MAX_TOKENS_AGENT', 1200)),
 };
 
 export type RagConfig = typeof ragConfig;

@@ -28,7 +28,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
 interface ChatSession {
   id: string;
   name: string;
-  mode: "client" | "learner";
+  mode: "client" | "learner" | "agent";
   created_at: string;
   updated_at: string;
 }
@@ -46,6 +46,10 @@ interface Message {
     ref?: number;
   }>;
   created_at: string;
+  stop_reason?: string;
+  iterations?: number;
+  cost_usd?: number;
+  total_tokens?: number;
 }
 
 interface StreamFinalPayload {
@@ -55,6 +59,10 @@ interface StreamFinalPayload {
   model?: string;
   response_time_ms?: number;
   chat_saved?: boolean;
+  stop_reason?: string;
+  iterations?: number;
+  cost_usd?: number;
+  total_tokens?: number;
 }
 
 // ============================================================================
@@ -126,7 +134,7 @@ function NewSessionModal({
   onRedirect,
 }: NewSessionModalProps) {
   const [name, setName] = useState("");
-  const [mode, setMode] = useState<"client" | "learner">("client");
+  const [mode, setMode] = useState<"client" | "learner" | "agent">("client");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -181,12 +189,24 @@ function NewSessionModal({
           >
             Learner
           </button>
+          <button
+            onClick={() => setMode("agent")}
+            className={`flex-1 py-2 text-sm font-medium transition-colors ${
+              mode === "agent"
+                ? "bg-gold-gradient text-black"
+                : "bg-[#141414] text-gray-400 hover:bg-[#2B2B2B]"
+            }`}
+          >
+            Agent
+          </button>
         </div>
 
         <p className='text-xs text-gray-500 mb-4'>
           {mode === "client"
             ? "Concise bullet-point answers for quick reference."
-            : "Expanded explanations with reasoning — ideal for learning."}
+            : mode === "learner"
+              ? "Expanded explanations with reasoning — ideal for learning."
+              : "AI searches and reasons step-by-step — best for complex questions."}
         </p>
 
         {/* Optional name */}
@@ -236,6 +256,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [streamStatus, setStreamStatus] = useState<string | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
@@ -399,7 +420,10 @@ export default function ChatPage() {
           if (!line) continue;
 
           const event = JSON.parse(line) as {
-            type: "delta" | "final" | "error";
+            type: "start" | "status" | "delta" | "final" | "error";
+            step?: string;
+            label?: string;
+            intent?: string;
             delta?: string;
             error?: string;
             answer?: string;
@@ -409,7 +433,13 @@ export default function ChatPage() {
             chat_saved?: boolean;
           };
 
+          if (event.type === "status" && event.label) {
+            setStreamStatus(event.label);
+            continue;
+          }
+
           if (event.type === "delta" && event.delta) {
+            setStreamStatus(null); // clear status once answer starts streaming
             setMessages((prev) =>
               prev.map((m) =>
                 m.id === tempId
@@ -443,6 +473,10 @@ export default function ChatPage() {
                 ...m,
                 response: finalPayload!.answer,
                 sources: finalPayload!.sources || [],
+                stop_reason: finalPayload!.stop_reason,
+                iterations: finalPayload!.iterations,
+                cost_usd: finalPayload!.cost_usd,
+                total_tokens: finalPayload!.total_tokens,
               }
             : m,
         ),
@@ -470,6 +504,7 @@ export default function ChatPage() {
       alert(error.message || "Failed to send message");
     } finally {
       setLoading(false);
+      setStreamStatus(null);
     }
   };
 
@@ -569,9 +604,11 @@ export default function ChatPage() {
                   <div className='flex items-center gap-1.5 mt-0.5'>
                     <span
                       className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${
-                        session.mode === "learner"
-                          ? "bg-gold/15 text-gold-light"
-                          : "bg-[#2B2B2B] text-gray-400"
+                        session.mode === "agent"
+                          ? "bg-emerald-500/15 text-emerald-400"
+                          : session.mode === "learner"
+                            ? "bg-gold/15 text-gold-light"
+                            : "bg-[#2B2B2B] text-gray-400"
                       }`}
                     >
                       {session.mode}
@@ -638,14 +675,18 @@ export default function ChatPage() {
             {activeSession && (
               <span
                 className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                  activeSession.mode === "learner"
-                    ? "bg-gold/15 text-gold-light"
-                    : "bg-[#2B2B2B] text-gray-400"
+                  activeSession.mode === "agent"
+                    ? "bg-emerald-500/15 text-emerald-400"
+                    : activeSession.mode === "learner"
+                      ? "bg-gold/15 text-gold-light"
+                      : "bg-[#2B2B2B] text-gray-400"
                 }`}
               >
-                {activeSession.mode === "learner"
-                  ? "Learner Mode"
-                  : "Client Mode"}
+                {activeSession.mode === "agent"
+                  ? "Agent Mode"
+                  : activeSession.mode === "learner"
+                    ? "Learner Mode"
+                    : "Client Mode"}
               </span>
             )}
           </div>
@@ -794,6 +835,36 @@ export default function ChatPage() {
                           </div>
                         </div>
                       )}
+
+                      {/* Agent metadata: stop reason, iterations, cost */}
+                      {message.stop_reason && (
+                        <div className='mt-3 pt-2 border-t border-[#2B2B2B] flex flex-wrap items-center gap-3 text-xs text-gray-500'>
+                          <span
+                            className={`px-1.5 py-0.5 rounded font-medium ${
+                              message.stop_reason === "completed"
+                                ? "bg-emerald-500/10 text-emerald-400"
+                                : "bg-amber-500/10 text-amber-400"
+                            }`}
+                          >
+                            {message.stop_reason === "completed"
+                              ? "Completed"
+                              : message.stop_reason === "max_iterations"
+                                ? "Hit iteration limit"
+                                : message.stop_reason === "timeout"
+                                  ? "Timed out"
+                                  : "Empty response"}
+                          </span>
+                          {message.iterations != null && (
+                            <span>{message.iterations} iteration{message.iterations !== 1 ? "s" : ""}</span>
+                          )}
+                          {message.total_tokens != null && (
+                            <span>{message.total_tokens.toLocaleString()} tokens</span>
+                          )}
+                          {message.cost_usd != null && (
+                            <span>${message.cost_usd.toFixed(4)}</span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -802,8 +873,13 @@ export default function ChatPage() {
 
             {loading && (
               <div className='flex justify-start'>
-                <div className='bg-[#1F1F1F] border border-[#2B2B2B] rounded-2xl px-5 py-4'>
-                  <Loader2 className='w-5 h-5 animate-spin text-gold' />
+                <div className='bg-[#1F1F1F] border border-[#2B2B2B] rounded-2xl px-5 py-4 flex items-center gap-2.5'>
+                  <Loader2 className='w-4 h-4 animate-spin text-gold shrink-0' />
+                  {streamStatus && (
+                    <span className='text-xs text-gray-400 animate-pulse'>
+                      {streamStatus}
+                    </span>
+                  )}
                 </div>
               </div>
             )}

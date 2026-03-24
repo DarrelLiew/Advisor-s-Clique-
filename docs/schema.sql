@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS public.chat_sessions (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
   name TEXT NOT NULL DEFAULT 'New Chat',
-  mode TEXT NOT NULL DEFAULT 'client' CHECK (mode IN ('client', 'learner')),
+  mode TEXT NOT NULL DEFAULT 'client' CHECK (mode IN ('client', 'learner', 'agent')),
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
 );

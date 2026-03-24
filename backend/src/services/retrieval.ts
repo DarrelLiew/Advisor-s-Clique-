@@ -23,6 +23,30 @@ type DomainClassification = {
   reason: string;
 };
 
+export type QueryIntentType =
+  | 'lookup'
+  | 'definition'
+  | 'broad_summary'
+  | 'comparison'
+  | 'calculation'
+  | 'process'
+  | 'compliance'
+  | 'unknown';
+
+export type QueryIntent = {
+  intent: QueryIntentType;
+  confidence: number;
+};
+
+export type SufficiencyMode = 'answer' | 'partial_answer' | 'abstain';
+
+export type SufficiencyResult = {
+  mode: SufficiencyMode;
+  confidence: number;
+  missing_reasons: string[];
+  closest_evidence: string; // "[filename, Page N]" of top chunk
+};
+
 // ============================================================================
 // OPTIMIZATION: In-memory caches for embeddings and classification
 // ============================================================================
@@ -65,9 +89,10 @@ class LRUCache<K, V> {
 
 const embeddingCache = new LRUCache<string, number[]>(200);
 
-// Classification cache with TTL (2 minutes)
+// Classification cache with TTL (2 minutes) — stores both domain + intent
 interface CachedClassification {
-  result: DomainClassification;
+  domain: DomainClassification;
+  intent: QueryIntent;
   expiresAt: number;
 }
 const classificationCache = new Map<string, CachedClassification>();
@@ -76,7 +101,7 @@ function getCacheKeyForClassification(queryText: string): string {
   return queryText.toLowerCase().trim();
 }
 
-function getCachedClassification(queryText: string): DomainClassification | null {
+function getCachedClassification(queryText: string): { domain: DomainClassification; intent: QueryIntent } | null {
   const key = getCacheKeyForClassification(queryText);
   const cached = classificationCache.get(key);
   if (!cached) return null;
@@ -84,13 +109,14 @@ function getCachedClassification(queryText: string): DomainClassification | null
     classificationCache.delete(key);
     return null;
   }
-  return cached.result;
+  return { domain: cached.domain, intent: cached.intent };
 }
 
-function setCachedClassification(queryText: string, result: DomainClassification): void {
+function setCachedClassification(queryText: string, domain: DomainClassification, intent: QueryIntent): void {
   const key = getCacheKeyForClassification(queryText);
   classificationCache.set(key, {
-    result,
+    domain,
+    intent,
     expiresAt: Date.now() + 2 * 60 * 1000, // 2-minute TTL
   });
 }
@@ -143,6 +169,52 @@ const CLEAR_OFF_TOPIC_PATTERN =
   /\b(super bowl|nba|nfl|epl|mlb|nhl|score|match result|weather|temperature|rain|recipe|cook|restaurant|movie|film|netflix|music|song|celebrity|gossip|travel itinerary|flight status|game walkthrough)\b/i;
 const COMPARATIVE_QUERY_PATTERN =
   /\b(compare|comparison|versus|vs\.?|difference|different|differ|best|better|worst|higher|highest|lower|lowest|shortest|longest|rank|ranking|breakeven|break even|which product|pros and cons|advantages?\s+(?:of|over|and)|disadvantages?\s+(?:of|over|and)|recommend\s+(?:between|among)|between .{1,60} and )\b/i;
+
+// ============================================================================
+// Intent router — heuristic-first, no extra LLM call
+// ============================================================================
+
+const INTENT_PATTERNS: Array<{ intent: QueryIntentType; pattern: RegExp }> = [
+  {
+    intent: 'broad_summary',
+    pattern: /\b(explain|summaris[e]?|summariz[e]?|overview|give me an overview|tell me about|what (is|does) this (product|document|policy|plan|fund|rider)|what (topics|sections) does (this|it) cover|what (does this|is this) cover|describe (this|the))\b/i,
+  },
+  {
+    intent: 'calculation',
+    pattern: /\b(calculat[e]?|comput[e]?|how much (is|will|would|are|can)|total (premium|payout|benefit|cost|amount)|breakeven|break[\s-]even|maximum loan|max loan|loan (amount|size|limit)|how many years|how long (will|would|does)|premium (total|amount)|payout comparison)\b/i,
+  },
+  {
+    intent: 'process',
+    pattern: /\b(how (do|can|should) (i|we|the (client|advisor))|steps? (to|for)|procedure (for|to)|process (for|to)|how to (submit|apply|file|make|request|change|update|cancel|renew|claim|service)|submission|apply for|filing a claim|claim process|servicing|how (is it|does it work))\b/i,
+  },
+  {
+    intent: 'compliance',
+    pattern: /\b(can (i|we|the advisor) (say|recommend|suggest|tell|advise|sell)|am i allowed|are we allowed|regulation|MAS (guideline|requirement|rule)|advisory (constraint|restriction|rule|requirement)|suitability (requirement|rule)|restricted (activity|product)|compliance (rule|guideline|requirement))\b/i,
+  },
+  {
+    intent: 'definition',
+    pattern: /\b(what (is|are|does) .{1,40} mean|define |meaning of |definition of |what (is|are) (a |an )?(gic|etf|mer|tpd|ivari|ilp|par|non[\s-]par|riders?|annuity|premium|deductible|exclusion|copay|coinsurance|sum assured|face amount|account value|surrender value|cash value|irr|nav|benchmark|allocation|distribution|dividend|bonus|loading))\b/i,
+  },
+];
+
+/**
+ * Classify query intent using heuristic patterns (no LLM call).
+ * Returns null if no pattern matches — caller should use LLM or default to lookup.
+ */
+function heuristicIntentClassification(query: string): QueryIntent | null {
+  // Comparative queries reuse the existing detection function
+  if (isComparativeQuery(query)) {
+    return { intent: 'comparison', confidence: 0.9 };
+  }
+
+  for (const { intent, pattern } of INTENT_PATTERNS) {
+    if (pattern.test(query)) {
+      return { intent, confidence: 0.85 };
+    }
+  }
+
+  return null;
+}
 
 function shouldBypassRewriteModel(
   queryText: string,
@@ -218,42 +290,67 @@ export async function rewriteQueryForRetrieval(
 }
 
 function heuristicDomainClassification(_query: string): DomainClassification {
-  // Conservative fallback when LLM classification fails â€” default to in-domain.
+  // Conservative fallback when LLM classification fails — default to in-domain.
   return { in_domain: true, is_financial: true, reason: 'Defaulting to in-domain — LLM classification unavailable.' };
 }
 
+const DEFAULT_INTENT: QueryIntent = { intent: 'lookup', confidence: 0.5 };
+
+/**
+ * Classifies both domain (in_domain / is_financial) AND query intent (lookup / comparison / etc.)
+ * in a single LLM call. Heuristic fast-paths avoid the LLM call when possible.
+ *
+ * Returns { domain, intent }.
+ */
 export async function classifyQueryDomain(
   openai: OpenAI,
   queryText: string,
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>
-): Promise<DomainClassification> {
+): Promise<{ domain: DomainClassification; intent: QueryIntent }> {
+  // Heuristic fast-path for clearly financial queries
   if (isClearlyFinancialQuery(queryText)) {
-    return {
+    const domain: DomainClassification = {
       in_domain: true,
       is_financial: true,
       reason: 'Heuristic fast-path: financial keyword match.',
     };
+    // Try to get intent from heuristic; fall through to LLM only for domain cache-miss cases
+    const hIntent = heuristicIntentClassification(queryText) ?? DEFAULT_INTENT;
+    return { domain, intent: hIntent };
   }
 
-  // Option E: Check classification cache (2-minute TTL)
+  // Check unified cache (2-minute TTL)
   const cached = getCachedClassification(queryText);
   if (cached) {
-    console.log(`[CLASSIFY][retrieval] cache_hit=true query="${queryText}"`);
+    console.log(`[CLASSIFY][retrieval] cache_hit=true query=”${queryText}”`);
     return cached;
   }
+
+  // Try heuristic intent classification before the LLM call
+  const heuristicIntent = heuristicIntentClassification(queryText);
 
   try {
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       {
         role: 'system',
         content:
-          'You are a query classifier for a financial advisory assistant. Classify each query into one of three tiers:\n' +
-          '1. in_domain=true, is_financial=true: Query is related to topics likely covered in uploaded advisory documents (compliance, products, client processes, regulations, internal procedures).\n' +
-          '2. in_domain=false, is_financial=true: Query is a general finance/business question (e.g. "What is a GIC?", "How do bonds work?", "What is MER?") â€” relevant to advisory work but unlikely to be in uploaded docs.\n' +
-          '3. in_domain=false, is_financial=false: Query has NO connection to finance, business, or professional advisory work (e.g. sports scores, cooking, weather, entertainment). These should be rejected.\n' +
-          'When in doubt between tier 1 and 2, choose tier 1. Only use tier 3 for clearly non-professional, non-financial topics.\n' +
-          'If conversation history is provided, use it to understand the context of the query. A short or ambiguous query that follows a financial/advisory conversation should be classified as tier 1 or tier 2, not tier 3.\n' +
-          'Return strict JSON only: {"in_domain": boolean, "is_financial": boolean, "reason": string}.',
+          'You are a query classifier for a financial advisory assistant. For each query, return a JSON object with:\n' +
+          '1. Domain tier (in_domain + is_financial):\n' +
+          '   - in_domain=true, is_financial=true: Query is related to topics likely covered in uploaded advisory documents.\n' +
+          '   - in_domain=false, is_financial=true: General finance/business question unlikely to be in uploaded docs.\n' +
+          '   - in_domain=false, is_financial=false: NO connection to finance or professional advisory work. Reject these.\n' +
+          '   When in doubt between tier 1 and 2, choose tier 1. Only use tier 3 for clearly non-financial topics.\n' +
+          '2. Intent (one of): lookup, definition, broad_summary, comparison, calculation, process, compliance, unknown\n' +
+          '   - lookup: asks for one specific fact (premium amount, interest rate, waiting period, etc.)\n' +
+          '   - definition: asks what a term means\n' +
+          '   - broad_summary: asks to explain or summarise a product/document\n' +
+          '   - comparison: compares products, banks, options, or asks which is better/faster/higher\n' +
+          '   - calculation: requires arithmetic (loan sizing, breakeven, totals, payout comparison)\n' +
+          '   - process: asks how to do a claim/servicing/submission/application step\n' +
+          '   - compliance: asks what can be said/done, suitability, MAS rules, advisory constraints\n' +
+          '   - unknown: unclear or mixed\n' +
+          'If conversation history is provided, use it to understand the context of the query.\n' +
+          'Return strict JSON only: {“in_domain”: boolean, “is_financial”: boolean, “intent”: string, “confidence”: number, “reason”: string}.',
       },
     ];
 
@@ -271,19 +368,26 @@ export async function classifyQueryDomain(
       model: 'gpt-4o-mini',
       messages,
       temperature: 0,
-      max_tokens: 50, // Reduced from 150 — classifier output is just ~25 tokens: {"in_domain":true,"is_financial":false}
+      max_tokens: 80, // slightly more than before to accommodate intent field
     });
 
     const raw = completion.choices[0].message.content?.trim();
-    if (!raw) return heuristicDomainClassification(queryText);
+    if (!raw) {
+      const domain = heuristicDomainClassification(queryText);
+      const intent = heuristicIntent ?? DEFAULT_INTENT;
+      return { domain, intent };
+    }
+
     const cleaned = raw
       .replace(/^```json\s*/i, '')
       .replace(/^```\s*/i, '')
       .replace(/\s*```$/i, '');
-    const parsed = JSON.parse(cleaned) as Partial<DomainClassification>;
+    const parsed = JSON.parse(cleaned) as Partial<DomainClassification & { intent: string; confidence: number }>;
 
     if (typeof parsed.in_domain !== 'boolean') {
-      return heuristicDomainClassification(queryText);
+      const domain = heuristicDomainClassification(queryText);
+      const intent = heuristicIntent ?? DEFAULT_INTENT;
+      return { domain, intent };
     }
 
     const modelIsFinancial = typeof parsed.is_financial === 'boolean' ? parsed.is_financial : true;
@@ -292,28 +396,205 @@ export async function classifyQueryDomain(
       : 'Domain classified by model.';
 
     // Safety override: avoid false reject on ambiguous short queries.
-    // We only allow hard reject when there is a clear off-topic lexical signal.
+    let domain: DomainClassification;
     if (!parsed.in_domain && !modelIsFinancial && !hasClearOffTopicSignal(queryText)) {
-      const result = {
-        in_domain: true,
-        is_financial: true,
-        reason: `Safety override applied: ${modelReason}`,
-      };
-      setCachedClassification(queryText, result);
-      return result;
+      domain = { in_domain: true, is_financial: true, reason: `Safety override applied: ${modelReason}` };
+    } else {
+      domain = { in_domain: parsed.in_domain, is_financial: modelIsFinancial, reason: modelReason };
     }
 
-    const result = {
-      in_domain: parsed.in_domain,
-      is_financial: modelIsFinancial,
-      reason: modelReason,
+    // Prefer heuristic intent (more reliable for clear cases); fall back to LLM intent
+    const validIntents: QueryIntentType[] = ['lookup', 'definition', 'broad_summary', 'comparison', 'calculation', 'process', 'compliance', 'unknown'];
+    const llmIntent = validIntents.includes(parsed.intent as QueryIntentType)
+      ? (parsed.intent as QueryIntentType)
+      : 'lookup';
+    const intent: QueryIntent = heuristicIntent ?? {
+      intent: llmIntent,
+      confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.7,
     };
-    // Option E: Cache the result (2-minute TTL)
-    setCachedClassification(queryText, result);
-    return result;
+
+    setCachedClassification(queryText, domain, intent);
+    console.log(`[CLASSIFY][retrieval] intent=${intent.intent} confidence=${intent.confidence.toFixed(2)} in_domain=${domain.in_domain} query=”${queryText.substring(0, 60)}”`);
+    return { domain, intent };
   } catch {
-    return heuristicDomainClassification(queryText);
+    const domain = heuristicDomainClassification(queryText);
+    const intent = heuristicIntent ?? DEFAULT_INTENT;
+    return { domain, intent };
   }
+}
+
+// ============================================================================
+// Evidence sufficiency check
+// ============================================================================
+
+/**
+ * Extract the most significant noun phrases from a query for coverage checking.
+ * Strips common stop words and short tokens. Returns up to 4 terms.
+ */
+function extractKeyTerms(query: string): string[] {
+  const STOP_WORDS = new Set([
+    'what', 'which', 'when', 'where', 'how', 'who', 'why', 'does', 'can', 'will',
+    'the', 'this', 'that', 'these', 'those', 'a', 'an', 'is', 'are', 'was', 'were',
+    'be', 'been', 'being', 'have', 'has', 'had', 'do', 'did', 'for', 'of', 'in',
+    'on', 'at', 'to', 'from', 'with', 'and', 'or', 'not', 'but', 'if', 'by',
+    'it', 'its', 'my', 'me', 'we', 'us', 'you', 'your', 'they', 'their', 'them',
+    'i', 'about', 'also', 'any', 'more', 'tell', 'give', 'show', 'explain', 'list',
+    'product', 'document', 'policy', 'please', 'get', 'find', 'want', 'need',
+    // Follow-up / conversational words (not topic-discriminative)
+    'would', 'could', 'should', 'shall', 'might', 'must', 'just', 'only', 'even',
+    'like', 'know', 'think', 'mean', 'make', 'made', 'take', 'look', 'help',
+    'said', 'says', 'same', 'other', 'another', 'each', 'every', 'most', 'some',
+    'related', 'section', 'part', 'page', 'above', 'below', 'here', 'there',
+    'client', 'customer', 'user', 'advisor', 'adviser', 'person', 'someone',
+    'question', 'answer', 'info', 'information', 'detail', 'details',
+    'thing', 'things', 'stuff', 'point', 'mentioned', 'based', 'refer',
+  ]);
+
+  // Extract multi-word phrases first (2-word) — more discriminative
+  const phrases: string[] = [];
+  const twoWordPattern = /\b([a-z]{3,}\s[a-z]{3,})\b/gi;
+  let m;
+  while ((m = twoWordPattern.exec(query)) !== null) {
+    const phrase = m[1].toLowerCase();
+    const words = phrase.split(' ');
+    if (!words.some((w) => STOP_WORDS.has(w))) {
+      phrases.push(phrase);
+    }
+  }
+
+  // Fall back to significant single words
+  const singleWords = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !STOP_WORDS.has(w));
+
+  // Prefer phrases, fill with single words, cap at 4
+  const combined = [...new Set([...phrases, ...singleWords])];
+  return combined.slice(0, 4);
+}
+
+/**
+ * Check whether the retrieved chunks actually contain sufficient evidence to
+ * answer the query. Runs heuristic checks only — no additional LLM call.
+ *
+ * Returns a SufficiencyResult indicating whether to answer, partially answer, or abstain.
+ */
+export function checkEvidenceSufficiency(params: {
+  chunks: Array<{ text: string; similarity: number; filename: string; page_number: number }>;
+  queryText: string;
+  intent: QueryIntentType;
+  matchThreshold: number;
+  minSourceSimilarity: number;
+}): SufficiencyResult {
+  const { chunks, queryText, intent, matchThreshold, minSourceSimilarity } = params;
+
+  // Check 1: No chunks at all
+  if (chunks.length === 0) {
+    return {
+      mode: 'abstain',
+      confidence: 1.0,
+      missing_reasons: ['No relevant document sections were found for this query.'],
+      closest_evidence: '',
+    };
+  }
+
+  const maxSim = Math.max(...chunks.map((c) => c.similarity));
+  const topChunk = chunks[0];
+  const closestEvidence = `[${topChunk.filename}, Page ${topChunk.page_number}]`;
+
+  // Check 2: Max similarity below match threshold — retrieval found nothing confident
+  if (maxSim < matchThreshold) {
+    return {
+      mode: 'abstain',
+      confidence: 0.9,
+      missing_reasons: [
+        `The retrieved sections have low relevance (max similarity: ${maxSim.toFixed(2)} vs threshold ${matchThreshold}).`,
+        'The uploaded documents may not contain information about this topic.',
+      ],
+      closest_evidence: closestEvidence,
+    };
+  }
+
+  // Check 3: Key term coverage — do the retrieved chunks actually mention what was asked?
+  const keyTerms = extractKeyTerms(queryText);
+  const allChunkText = chunks.map((c) => c.text.toLowerCase()).join(' ');
+
+  const coveredTerms = keyTerms.filter((term) => allChunkText.includes(term.toLowerCase()));
+  const uncoveredTerms = keyTerms.filter((term) => !allChunkText.includes(term.toLowerCase()));
+
+  if (keyTerms.length > 0 && coveredTerms.length === 0) {
+    // None of the key terms appear in any retrieved chunk.
+    // But if similarity is good, the chunks ARE relevant — the query just uses different wording.
+    // In that case, downgrade to partial_answer (let LLM try) instead of fully blocking.
+    if (maxSim >= minSourceSimilarity) {
+      return {
+        mode: 'partial_answer',
+        confidence: 0.65,
+        missing_reasons: [
+          'The retrieved sections may use different terminology than the query.',
+        ],
+        closest_evidence: closestEvidence,
+      };
+    }
+    return {
+      mode: 'abstain',
+      confidence: 0.85,
+      missing_reasons: [
+        `The key topic(s) “${keyTerms.slice(0, 2).join('”, “')}” do not appear in any retrieved document section.`,
+        'The documents may use different terminology or may not cover this specific topic.',
+      ],
+      closest_evidence: closestEvidence,
+    };
+  }
+
+  // Check 4: Calculation intent — ensure numeric inputs are present
+  if (intent === 'calculation') {
+    const hasNumericData = /[\d]+[\s]*[%$]|[\d]+\.[\d]+|[a-z]+[\s]+[\d]+/i.test(allChunkText);
+    if (!hasNumericData) {
+      return {
+        mode: 'partial_answer',
+        confidence: 0.7,
+        missing_reasons: ['The retrieved sections do not appear to contain the numeric inputs needed for this calculation.'],
+        closest_evidence: closestEvidence,
+      };
+    }
+  }
+
+  // Check 5: Partial term coverage — some terms found, some missing
+  if (keyTerms.length >= 2 && uncoveredTerms.length > 0 && coveredTerms.length < keyTerms.length) {
+    // More than half the terms are missing → likely partial answer
+    if (uncoveredTerms.length > coveredTerms.length) {
+      return {
+        mode: 'partial_answer',
+        confidence: 0.75,
+        missing_reasons: [
+          `Some aspects of the query could not be confirmed: “${uncoveredTerms.slice(0, 2).join('”, “')}” were not found in retrieved sections.`,
+        ],
+        closest_evidence: closestEvidence,
+      };
+    }
+  }
+
+  // Check 6: Evidence found but below source similarity threshold — still answer, but note low confidence
+  if (maxSim < minSourceSimilarity) {
+    return {
+      mode: 'partial_answer',
+      confidence: 0.6,
+      missing_reasons: [
+        'The retrieved document sections are only marginally relevant to this question.',
+      ],
+      closest_evidence: closestEvidence,
+    };
+  }
+
+  // Sufficient evidence
+  return {
+    mode: 'answer',
+    confidence: Math.min(1.0, maxSim + 0.1),
+    missing_reasons: [],
+    closest_evidence: closestEvidence,
+  };
 }
 
 async function rerankChunks(

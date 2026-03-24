@@ -4,7 +4,8 @@
  * with only output formatting differing by platform.
  */
 
-export type ChatMode = 'client' | 'learner';
+export type ChatMode = 'client' | 'learner' | 'agent';
+export type { QueryIntentType } from './retrieval';
 
 export interface ReferenceEntry {
   refNum: number;
@@ -52,6 +53,31 @@ export function buildNumberedContext(context: string): {
   };
 }
 
+// Intent-specific prompt additions injected after base instructions, before context
+function buildIntentInstructions(intent: string | undefined, partialMissingReasons?: string[]): string {
+  const partialNote = partialMissingReasons && partialMissingReasons.length > 0
+    ? `\nIMPORTANT PARTIAL COVERAGE NOTE: The following aspects of the query cannot be fully confirmed from the retrieved document sections: ${partialMissingReasons.map((r) => `"${r}"`).join('; ')}. Answer ONLY the parts that are directly supported by the context below. For unsupported parts, explicitly state they are not found in the uploaded documents. Do not infer or estimate missing information.\n`
+    : '';
+
+  switch (intent) {
+    case 'broad_summary':
+      return `\nSUMMARY MODE: Structure your answer using these sections in order. Skip any section not covered in the documents, but explicitly state it is not covered:\n1. What this product/document is\n2. Who it is designed for\n3. Key benefits and features\n4. Key risks, exclusions, and limitations\n5. Fees, charges, or premiums\n6. Flexibility, options, and servicing features\n7. Important notes or assumptions\n8. Source type (contractual / illustrative / marketing material)\nUse bold section headers (e.g., **1. What this product is**). Include citations on every data line.\n${partialNote}`;
+
+    case 'comparison':
+      return `\nCOMPARISON MODE: Structure your answer as:\n- **Options compared:** list all products/banks/options found in the context\n- **Criteria:** list the dimensions being compared\n- **Evidence per option:** quote the relevant data for each option with citations\n- **Conclusion:** provide a conclusion ONLY if evidence supports it for ALL options\n- **Caveats:** explicitly state any missing data before concluding\nDo NOT declare a winner if evidence for one or more options is missing or incomplete. If only one option has data, state that a full comparison cannot be made.\n${partialNote}`;
+
+    case 'calculation':
+      return `\nCALCULATION MODE: Structure your answer as:\n1. **Inputs found in documents:** list each numeric input you are using, with its citation\n2. **Formula or method:** state the calculation approach\n3. **Step-by-step computation:** show each step explicitly\n4. **Result:** state the final answer\nIf any required input is missing from the documents, state it explicitly and do NOT estimate or assume a value. If inputs are insufficient, state only what can be confirmed.\n${partialNote}`;
+
+    case 'process':
+    case 'compliance':
+      return `\nPROCESS/COMPLIANCE MODE: Prefer exact wording from the documents over paraphrasing or summarising. Quote procedural steps, regulatory requirements, and compliance rules directly where possible. If suitability depends on client profile information not present in the documents, state that it cannot be concluded from the documents alone. Do not give advisory recommendations disguised as factual document answers.\n${partialNote}`;
+
+    default:
+      return partialNote;
+  }
+}
+
 /**
  * Builds a system prompt for the LLM based on context availability and mode.
  * Both web and Telegram use the same prompt, only post-processing differs.
@@ -60,6 +86,8 @@ export function buildNumberedContext(context: string): {
  * @param mode - Chat mode: 'client' (concise) or 'learner' (expanded explanations)
  * @param usedWebFallback - Whether this is a web fallback (financial Q not in documents)
  * @param referenceMap - The numbered reference map (from buildNumberedContext)
+ * @param intent - Query intent type for intent-specific prompt instructions
+ * @param partialMissingReasons - Missing aspects from sufficiency check (for partial_answer mode)
  * @returns System prompt string to send to the LLM
  */
 export function buildSystemPrompt(
@@ -67,6 +95,8 @@ export function buildSystemPrompt(
   mode: ChatMode,
   usedWebFallback: boolean,
   referenceMap?: ReferenceEntry[],
+  intent?: string,
+  partialMissingReasons?: string[],
 ): string {
   if (usedWebFallback) {
     return `You are a knowledgeable financial advisory assistant. This question is not covered in the uploaded documents, so answer using your general knowledge.
@@ -139,7 +169,9 @@ ${citationWhitelistInstruction}
     ? `\n- LEARNER MODE: For each bullet point, provide an expanded explanation (2-4 sentences) drawing from the document context. Explain the reasoning, implications, or background so a junior advisor can fully understand.`
     : `\n- CLIENT MODE: Present ALL relevant information from the documents as bullet points. Keep each point to 1-2 sentences. Do not skip or omit information - include every relevant fact, but state it briefly.\n- CLIENT MODE (NUMERIC ACCURACY): For table-like answers, output one row per explicit source row and do not compress by inferring or merging missing rows.`;
 
-  return `${baseInstructions}${modeInstructions}
+  const intentInstructions = buildIntentInstructions(intent, partialMissingReasons);
+
+  return `${baseInstructions}${modeInstructions}${intentInstructions}
 
 Context from documents:
 ${context}`;

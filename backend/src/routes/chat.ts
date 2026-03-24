@@ -1,13 +1,15 @@
 ﻿import { Router } from 'express';
 import OpenAI from 'openai';
 import { authenticateUser, AuthenticatedRequest } from '../middleware/auth';
-import { classifyQueryDomain, retrieveContextForQuery } from '../services/retrieval';
+import { classifyQueryDomain, retrieveContextForQuery, checkEvidenceSufficiency, QueryIntentType } from '../services/retrieval';
 import { supabase } from '../lib/supabase';
 import { chatLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
 import { buildSystemPrompt, buildNumberedContext, ReferenceEntry } from '../services/promptBuilder';
 import { ragConfig } from '../services/ragConfig';
+import { runAgent } from '../agent/agent';
+import { CostTracker } from '../agent/costTracker';
 
 const router = Router();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -132,7 +134,7 @@ function stripChunkHeader(text: string): string {
 /**
  * Given the reference map and the retrieved chunks, resolve cited references
  * to full source objects. Each reference maps directly to a specific
- * document_id + page via the reference map — no ambiguity.
+ * document_id + page via the reference map -- no ambiguity.
  */
 function resolveSourcesForRefs(
   referenceMap: ReferenceEntry[],
@@ -342,8 +344,8 @@ router.post('/sessions', authenticateUser, async (req: AuthenticatedRequest, res
     const userId = req.user!.id;
     const { name = 'New Chat', mode = 'client' } = req.body;
 
-    if (!['client', 'learner'].includes(mode)) {
-      return res.status(400).json({ error: 'mode must be "client" or "learner"' });
+    if (!['client', 'learner', 'agent'].includes(mode)) {
+      return res.status(400).json({ error: 'mode must be "client", "learner", or "agent"' });
     }
 
     const { data, error } = await supabase
@@ -487,15 +489,15 @@ router.post(
       const queryText = query.trim();
       const timings: Record<string, number> = {};
 
-      // 1. Classify domain â€” three-tier: in-docs / financial-general / off-topic
+      // 1. Classify domain + intent -- three-tier: in-docs / financial-general / off-topic
       const classifyStart = Date.now();
-      const domain = await classifyQueryDomain(openai, queryText, conversationHistory);
+      const { domain, intent } = await classifyQueryDomain(openai, queryText, conversationHistory);
       timings.classification_ms = elapsedMs(classifyStart);
       let usedWebFallback = false;
       let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
 
       if (!domain.in_domain && !domain.is_financial) {
-        // 2a. Completely off-topic â€” reject with scope message
+        // 2a. Completely off-topic -- reject with scope message
         const responseTime = Date.now() - startTime;
         const rejectionMsg = "I'm here to help with financial advisory topics. That question falls outside the scope of this assistant.";
         console.log(`[RAG][chat] rejected query="${queryText}" reason="${domain.reason}"`);
@@ -505,13 +507,13 @@ router.post(
           userId,
           queryText: query,
           responseTimeMs: responseTime,
-          metadata: { outcome: 'domain_gate_reject', reason: domain.reason },
+          metadata: { outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent },
         });
 
-        return res.json({ answer: rejectionMsg, sources: [], response_time_ms: responseTime, chat_saved: true });
+        return res.json({ answer: rejectionMsg, sources: [], response_time_ms: responseTime, chat_saved: true, intent: intent.intent, answer_mode: 'rejected' });
       }
 
-      // 2b. Always attempt retrieval for any financial query â€” let vector search decide
+      // 2b. Always attempt retrieval for any financial query -- let vector search decide
       const retrievalStart = Date.now();
       retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat', conversationHistory });
       timings.retrieval_ms = elapsedMs(retrievalStart);
@@ -524,6 +526,52 @@ router.post(
         console.log(`[RAG][chat] context_preview="${retrieval.context.substring(0, 500)}..."`);
       }
 
+      // 2c. Evidence sufficiency check (enhanced routing only, skip for web fallback)
+      let answerMode: string = 'direct_answer';
+      let abstentionAnswer: string | null = null;
+      let partialMissingReasons: string[] | undefined;
+
+      if (ragConfig.enableEnhancedRouting && !usedWebFallback && retrieval) {
+        const sufficiency = checkEvidenceSufficiency({
+          chunks: retrieval.chunks,
+          queryText,
+          intent: intent.intent as QueryIntentType,
+          matchThreshold: ragConfig.matchThreshold,
+          minSourceSimilarity: ragConfig.minSourceSimilarity,
+        });
+        console.log(`[SUFFICIENCY][chat] mode=${sufficiency.mode} confidence=${sufficiency.confidence.toFixed(2)} missing=${JSON.stringify(sufficiency.missing_reasons)}`);
+
+        if (sufficiency.mode === 'abstain') {
+          answerMode = 'insufficient_evidence';
+          const closestPart = sufficiency.closest_evidence
+            ? `\n\nThe closest section I found was: ${sufficiency.closest_evidence}`
+            : '';
+          abstentionAnswer = `The uploaded documents do not contain sufficient information to answer this question.\n\n${sufficiency.missing_reasons.join(' ')}${closestPart}\n\nIf this information is in a document that has not yet been uploaded, please add it and try again.`;
+        } else if (sufficiency.mode === 'partial_answer') {
+          answerMode = 'partial_answer';
+          partialMissingReasons = sufficiency.missing_reasons;
+        }
+      }
+
+      // 2d. Return abstention without calling the LLM
+      if (abstentionAnswer !== null) {
+        const responseTime = Date.now() - startTime;
+        await supabase.from('chat_messages').insert({ user_id: userId, session_id, query, response: abstentionAnswer, sources: [] });
+        supabase.from('chat_sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id).then(() => {});
+        logQueryAnalytics({
+          userId,
+          queryText: query,
+          responseTimeMs: responseTime,
+          metadata: {
+            outcome: 'insufficient_evidence',
+            intent: intent.intent,
+            answer_mode: answerMode,
+            chunks_retrieved: retrieval?.chunks.length ?? 0,
+          },
+        });
+        return res.json({ answer: abstentionAnswer, sources: [], response_time_ms: responseTime, chat_saved: true, intent: intent.intent, answer_mode: answerMode });
+      }
+
       // 3. Build system prompt using unified builder (same for web and Telegram)
       const promptBuildStart = Date.now();
       const { numberedContext, referenceMap } = buildNumberedContext(retrieval?.context || '');
@@ -532,6 +580,8 @@ router.post(
         session.mode as 'client' | 'learner',
         usedWebFallback,
         referenceMap,
+        ragConfig.enableEnhancedRouting ? intent.intent : undefined,
+        partialMissingReasons,
       );
       timings.prompt_build_ms = elapsedMs(promptBuildStart);
 
@@ -566,7 +616,7 @@ router.post(
       });
       const processedAnswer = finalized.processedAnswer;
       const filteredSources = finalized.filteredSources;
-      const analyticsOutcome = finalized.analyticsOutcome;
+      const analyticsOutcome = answerMode === 'partial_answer' ? 'partial_answer' : finalized.analyticsOutcome;
       timings.citation_mapping_ms = finalized.citationMappingMs;
 
       // 5. Save to chat history with session_id
@@ -598,6 +648,8 @@ router.post(
         responseTimeMs: responseTime,
         metadata: {
           outcome: analyticsOutcome,
+          intent: intent.intent,
+          answer_mode: answerMode,
           rewritten_query: retrieval?.rewrittenQuery,
           chunks_retrieved: retrieval?.chunks.length ?? 0,
           source_count: filteredSources.length,
@@ -605,7 +657,7 @@ router.post(
       });
 
       console.log(
-        `[PERF][chat] total_ms=${responseTime} classification_ms=${timings.classification_ms ?? 0} retrieval_ms=${timings.retrieval_ms ?? 0} prompt_build_ms=${timings.prompt_build_ms ?? 0} llm_ms=${timings.llm_ms ?? 0} citation_mapping_ms=${timings.citation_mapping_ms ?? 0} chat_save_ms=${timings.chat_save_ms ?? 0} outcome=${analyticsOutcome} chunks=${retrieval?.chunks.length ?? 0} sources=${filteredSources.length}`
+        `[PERF][chat] total_ms=${responseTime} classification_ms=${timings.classification_ms ?? 0} retrieval_ms=${timings.retrieval_ms ?? 0} prompt_build_ms=${timings.prompt_build_ms ?? 0} llm_ms=${timings.llm_ms ?? 0} citation_mapping_ms=${timings.citation_mapping_ms ?? 0} chat_save_ms=${timings.chat_save_ms ?? 0} outcome=${analyticsOutcome} intent=${intent.intent} answer_mode=${answerMode} chunks=${retrieval?.chunks.length ?? 0} sources=${filteredSources.length}`
       );
 
       res.json({
@@ -614,6 +666,8 @@ router.post(
         model: completion.model,
         response_time_ms: responseTime,
         chat_saved: chatSaved,
+        intent: intent.intent,
+        answer_mode: answerMode,
       });
     } catch (error: any) {
       console.error('Chat error:', error);
@@ -697,8 +751,158 @@ router.post(
       const queryText = query.trim();
       const timings: Record<string, number> = {};
 
+      // ================================================================
+      // AGENT MODE — separate pipeline using tool-calling loop
+      // ================================================================
+      if (session.mode === 'agent') {
+        writeEvent({ type: 'status', step: 'thinking', label: 'Reading your question...' });
+
+        const agentResult = await runAgent(openai, queryText, session_id, {
+          onToolCall: (toolName, args) => {
+            const label = toolName === 'search_documents'
+              ? `Searching for ${(args.query as string || '').slice(0, 60)}...`
+              : toolName === 'get_document_pages'
+                ? `Expanding page context...`
+                : toolName === 'calculate'
+                  ? `Calculating ${(args.description as string || args.expression as string || '').slice(0, 60)}...`
+                  : `Using ${toolName}...`;
+            writeEvent({ type: 'status', step: 'tool_use', label });
+          },
+          onGenerating: () => {
+            writeEvent({ type: 'status', step: 'generating', label: 'Writing answer...' });
+          },
+        });
+
+        const responseTime = elapsedMs(startTime);
+
+        // Stream the answer as deltas (character chunks for visual streaming)
+        writeEvent({ type: 'status', step: 'generating', label: 'Writing answer...' });
+        const DELTA_SIZE = 12;
+        for (let i = 0; i < agentResult.answer.length; i += DELTA_SIZE) {
+          writeEvent({ type: 'delta', delta: agentResult.answer.slice(i, i + DELTA_SIZE) });
+        }
+
+        // Build sources from collected chunks (use the same citation resolution as client/learner)
+        const { numberedContext: agentNumberedCtx, referenceMap: agentRefMap } = buildNumberedContext(
+          agentResult.chunks
+            .filter((c) => c.similarity > 0)
+            .map((c) => `[${c.filename}, Page ${c.page_number}]\n${c.text}`)
+            .join('\n\n---\n\n'),
+        );
+
+        // Agent uses [p.X] citations — extract page numbers and map to sources
+        const pageCiteRefs = new Set<number>();
+        const pageCiteMatches = agentResult.answer.match(/\[p\.(\d+)\]/g) || [];
+        for (const m of pageCiteMatches) {
+          const n = parseInt(m.slice(3, -1), 10);
+          if (!Number.isNaN(n)) pageCiteRefs.add(n);
+        }
+
+        // Build source list from chunks whose pages were cited
+        const agentSources: ChatSource[] = [];
+        const seenSourceKeys = new Set<string>();
+        for (const chunk of agentResult.chunks) {
+          if (!pageCiteRefs.has(chunk.page_number)) continue;
+          const key = `${chunk.document_id}:${chunk.page_number}`;
+          if (seenSourceKeys.has(key)) continue;
+          seenSourceKeys.add(key);
+          agentSources.push({
+            filename: chunk.filename,
+            page: chunk.page_number,
+            similarity: Math.round(chunk.similarity * 100) / 100,
+            document_id: chunk.document_id,
+            text: chunk.text?.slice(0, 500),
+          });
+        }
+
+        // Convert [p.X] citations to numbered [N] format for consistency
+        let processedAgentAnswer = agentResult.answer;
+        const pageToRef = new Map<number, number>();
+        let refCounter = 1;
+        for (const src of agentSources) {
+          if (!pageToRef.has(src.page)) {
+            pageToRef.set(src.page, refCounter);
+            src.ref = refCounter;
+            refCounter++;
+          }
+        }
+        processedAgentAnswer = processedAgentAnswer.replace(/\[p\.(\d+)\]/g, (match, pageStr: string) => {
+          const page = parseInt(pageStr, 10);
+          const ref = pageToRef.get(page);
+          return ref ? `**[${ref}]**` : match;
+        });
+        processedAgentAnswer = formatAnswer(processedAgentAnswer);
+
+        // Save to DB
+        const { error: agentInsertError } = await supabase.from('chat_messages').insert({
+          user_id: userId,
+          session_id,
+          query,
+          response: processedAgentAnswer,
+          sources: agentSources,
+        });
+        const agentChatSaved = !agentInsertError;
+        if (agentInsertError) console.error('Failed to save agent chat message:', agentInsertError);
+
+        supabase.from('chat_sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id).then(() => {});
+
+        // Cost tracking — log to file
+        const costTracker = new CostTracker();
+        for (const entry of agentResult.cost.entries) {
+          costTracker.record(entry.model, { prompt_tokens: entry.input_tokens, completion_tokens: entry.output_tokens });
+        }
+        costTracker.writeToLog({ userId, mode: 'agent', query: queryText, iterations: agentResult.iterations });
+
+        // Analytics
+        logQueryAnalytics({
+          userId,
+          queryText: query,
+          responseTimeMs: responseTime,
+          metadata: {
+            outcome: 'success',
+            answer_mode: 'agent',
+            stop_reason: agentResult.stopReason,
+            iterations: agentResult.iterations,
+            tools_used: agentResult.toolCalls.map((t) => t.name),
+            chunks_retrieved: agentResult.chunks.length,
+            source_count: agentSources.length,
+            cost_usd: agentResult.cost.cost_usd,
+            total_tokens: agentResult.cost.total_tokens,
+          },
+        });
+
+        console.log(
+          `[PERF][agent] total_ms=${responseTime} stop_reason=${agentResult.stopReason} iterations=${agentResult.iterations} ` +
+          `tools=${agentResult.toolCalls.map((t) => t.name).join(',')} ` +
+          `chunks=${agentResult.chunks.length} sources=${agentSources.length} ` +
+          `tokens=${agentResult.cost.total_tokens} cost=$${agentResult.cost.cost_usd.toFixed(6)}`,
+        );
+
+        writeEvent({
+          type: 'final',
+          answer: processedAgentAnswer,
+          sources: agentSources,
+          model: 'gpt-4o-mini',
+          response_time_ms: responseTime,
+          chat_saved: agentChatSaved,
+          answer_mode: 'agent',
+          cost_usd: agentResult.cost.cost_usd,
+          total_tokens: agentResult.cost.total_tokens,
+          stop_reason: agentResult.stopReason,
+          iterations: agentResult.iterations,
+        });
+        res.end();
+        return;
+      }
+
+      // ================================================================
+      // CLIENT / LEARNER MODE — existing linear pipeline (unchanged)
+      // ================================================================
+
+      // 1. Classify domain + intent
+      writeEvent({ type: 'status', step: 'classifying', label: 'Understanding your question...' });
       const classifyStart = Date.now();
-      const domain = await classifyQueryDomain(openai, queryText, conversationHistory);
+      const { domain, intent } = await classifyQueryDomain(openai, queryText, conversationHistory);
       timings.classification_ms = elapsedMs(classifyStart);
 
       let usedWebFallback = false;
@@ -721,7 +925,7 @@ router.post(
           userId,
           queryText: query,
           responseTimeMs: responseTime,
-          metadata: { outcome: 'domain_gate_reject', reason: domain.reason },
+          metadata: { outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent },
         });
 
         writeEvent({
@@ -730,11 +934,15 @@ router.post(
           sources: [],
           response_time_ms: responseTime,
           chat_saved: true,
+          intent: intent.intent,
+          answer_mode: 'rejected',
         });
         res.end();
         return;
       }
 
+      // 2. Retrieve
+      writeEvent({ type: 'status', step: 'retrieving', label: 'Searching documents...' });
       const retrievalStart = Date.now();
       retrieval = await retrieveContextForQuery({ openai, queryText, logLabel: 'chat', conversationHistory });
       timings.retrieval_ms = elapsedMs(retrievalStart);
@@ -744,9 +952,66 @@ router.post(
         console.log(`[RAG][chat] ${noChunks ? 'no_chunks_found' : 'out_of_domain_fallback'} query="${queryText}" in_domain=${domain.in_domain} reason="${domain.reason}"`);
       } else {
         console.log(`[RAG][chat] context_length=${retrieval.context.length} sources=${retrieval.sources.length} usedWebFallback=${usedWebFallback}`);
-        console.log(`[RAG][chat] context_preview="${retrieval.context.substring(0, 500)}..."`);
       }
 
+      // 3. Evidence sufficiency check + intent-specific thinking status
+      let streamAnswerMode = 'direct_answer';
+      let streamPartialMissingReasons: string[] | undefined;
+
+      if (ragConfig.enableEnhancedRouting && !usedWebFallback && retrieval) {
+        const intentLabels: Record<string, string> = {
+          broad_summary: 'Summarising documents...',
+          comparison: 'Comparing options...',
+          calculation: 'Preparing calculation...',
+          process: 'Finding procedure steps...',
+          compliance: 'Checking compliance guidance...',
+          definition: 'Looking up definition...',
+          lookup: 'Looking up answer...',
+        };
+        writeEvent({
+          type: 'status',
+          step: 'thinking',
+          intent: intent.intent,
+          label: intentLabels[intent.intent] ?? 'Analysing question...',
+        });
+
+        const sufficiency = checkEvidenceSufficiency({
+          chunks: retrieval.chunks,
+          queryText,
+          intent: intent.intent as QueryIntentType,
+          matchThreshold: ragConfig.matchThreshold,
+          minSourceSimilarity: ragConfig.minSourceSimilarity,
+        });
+        console.log(`[SUFFICIENCY][chat/stream] mode=${sufficiency.mode} confidence=${sufficiency.confidence.toFixed(2)} missing=${JSON.stringify(sufficiency.missing_reasons)}`);
+
+        if (sufficiency.mode === 'abstain') {
+          streamAnswerMode = 'insufficient_evidence';
+          const closestPart = sufficiency.closest_evidence
+            ? `\n\nThe closest section I found was: ${sufficiency.closest_evidence}`
+            : '';
+          const abstentionAnswer = `The uploaded documents do not contain sufficient information to answer this question.\n\n${sufficiency.missing_reasons.join(' ')}${closestPart}\n\nIf this information is in a document that has not yet been uploaded, please add it and try again.`;
+
+          await supabase.from('chat_messages').insert({ user_id: userId, session_id, query, response: abstentionAnswer, sources: [] });
+          supabase.from('chat_sessions').update({ updated_at: new Date().toISOString() }).eq('id', session_id).then(() => {});
+          logQueryAnalytics({
+            userId,
+            queryText: query,
+            responseTimeMs: elapsedMs(startTime),
+            metadata: { outcome: 'insufficient_evidence', intent: intent.intent, answer_mode: streamAnswerMode, chunks_retrieved: retrieval.chunks.length },
+          });
+          writeEvent({ type: 'final', answer: abstentionAnswer, sources: [], response_time_ms: elapsedMs(startTime), chat_saved: true, intent: intent.intent, answer_mode: streamAnswerMode });
+          res.end();
+          return;
+        } else if (sufficiency.mode === 'partial_answer') {
+          streamAnswerMode = 'partial_answer';
+          streamPartialMissingReasons = sufficiency.missing_reasons;
+        }
+      } else if (!ragConfig.enableEnhancedRouting) {
+        writeEvent({ type: 'status', step: 'thinking', intent: intent.intent, label: 'Analysing question...' });
+      }
+
+      // 4. Build prompt
+      writeEvent({ type: 'status', step: 'generating', label: 'Generating answer...' });
       const promptBuildStart = Date.now();
       const { numberedContext: streamNumberedContext, referenceMap: streamReferenceMap } = buildNumberedContext(retrieval?.context || '');
       const systemPrompt = buildSystemPrompt(
@@ -754,6 +1019,8 @@ router.post(
         session.mode as 'client' | 'learner',
         usedWebFallback,
         streamReferenceMap,
+        ragConfig.enableEnhancedRouting ? intent.intent : undefined,
+        streamPartialMissingReasons,
       );
       timings.prompt_build_ms = elapsedMs(promptBuildStart);
 
@@ -773,19 +1040,28 @@ router.post(
         temperature: 0,
         max_tokens: generationMaxTokens,
         stream: true,
+        stream_options: { include_usage: true },
       });
 
       let streamedAnswer = '';
       let modelName = 'gpt-4o-mini';
+      let streamUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
 
       for await (const chunk of stream) {
         if (chunk.model) modelName = chunk.model;
+        if (chunk.usage) streamUsage = chunk.usage;
         const delta = chunk.choices[0]?.delta?.content;
         if (!delta) continue;
         streamedAnswer += delta;
         writeEvent({ type: 'delta', delta });
       }
       timings.llm_ms = elapsedMs(llmStart);
+
+      // Cost tracking for client/learner modes
+      const pipeCostTracker = new CostTracker();
+      if (streamUsage) pipeCostTracker.record(modelName, streamUsage);
+      const pipeCost = pipeCostTracker.getTotals();
+      pipeCostTracker.writeToLog({ userId, mode: session.mode, query: queryText });
 
       const answer = streamedAnswer || 'No response generated.';
       const responseTime = elapsedMs(startTime);
@@ -799,7 +1075,7 @@ router.post(
       });
       const processedAnswer = finalized.processedAnswer;
       const filteredSources = finalized.filteredSources;
-      const analyticsOutcome = finalized.analyticsOutcome;
+      const analyticsOutcome = streamAnswerMode === 'partial_answer' ? 'partial_answer' : finalized.analyticsOutcome;
       timings.citation_mapping_ms = finalized.citationMappingMs;
 
       const saveStart = Date.now();
@@ -828,14 +1104,18 @@ router.post(
         responseTimeMs: responseTime,
         metadata: {
           outcome: analyticsOutcome,
+          intent: intent.intent,
+          answer_mode: streamAnswerMode,
           rewritten_query: retrieval?.rewrittenQuery,
           chunks_retrieved: retrieval?.chunks.length ?? 0,
           source_count: filteredSources.length,
+          cost_usd: pipeCost.cost_usd,
+          total_tokens: pipeCost.total_tokens,
         },
       });
 
       console.log(
-        `[PERF][chat] total_ms=${responseTime} classification_ms=${timings.classification_ms ?? 0} retrieval_ms=${timings.retrieval_ms ?? 0} prompt_build_ms=${timings.prompt_build_ms ?? 0} llm_ms=${timings.llm_ms ?? 0} citation_mapping_ms=${timings.citation_mapping_ms ?? 0} chat_save_ms=${timings.chat_save_ms ?? 0} outcome=${analyticsOutcome} chunks=${retrieval?.chunks.length ?? 0} sources=${filteredSources.length}`
+        `[PERF][chat] total_ms=${responseTime} classification_ms=${timings.classification_ms ?? 0} retrieval_ms=${timings.retrieval_ms ?? 0} prompt_build_ms=${timings.prompt_build_ms ?? 0} llm_ms=${timings.llm_ms ?? 0} citation_mapping_ms=${timings.citation_mapping_ms ?? 0} chat_save_ms=${timings.chat_save_ms ?? 0} outcome=${analyticsOutcome} intent=${intent.intent} answer_mode=${streamAnswerMode} chunks=${retrieval?.chunks.length ?? 0} sources=${filteredSources.length} tokens=${pipeCost.total_tokens} cost=$${pipeCost.cost_usd.toFixed(6)}`
       );
 
       writeEvent({
@@ -845,6 +1125,10 @@ router.post(
         model: modelName,
         response_time_ms: responseTime,
         chat_saved: chatSaved,
+        intent: intent.intent,
+        answer_mode: streamAnswerMode,
+        cost_usd: pipeCost.cost_usd,
+        total_tokens: pipeCost.total_tokens,
       });
       res.end();
     } catch (error: any) {
@@ -874,7 +1158,7 @@ router.get('/history', authenticateUser, async (req: AuthenticatedRequest, res) 
     const { session_id } = req.query;
     const limit = parseInt(req.query.limit as string, 10) || 50;
 
-    // No session_id â€” return empty (supports old clients during transition)
+    // No session_id â€" return empty (supports old clients during transition)
     if (!session_id) {
       return res.json({ messages: [] });
     }

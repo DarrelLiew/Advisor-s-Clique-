@@ -4,7 +4,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { supabase } from '../lib/supabase';
-import { classifyQueryDomain, retrieveContextForQuery } from '../services/retrieval';
+import { classifyQueryDomain, retrieveContextForQuery, checkEvidenceSufficiency, QueryIntentType } from '../services/retrieval';
 import { telegramLimiter, rateLimitMiddleware } from '../utils/rateLimiter';
 import { getSignedDocumentUrl } from '../utils/documentUrl';
 import { logQueryAnalytics } from '../utils/analyticsLog';
@@ -332,11 +332,11 @@ async function handleQuery(
 
   // 1. Classify domain + retrieve context in parallel for speed
   const pipelineStart = Date.now();
-  const [domainResult, retrievalResult] = await Promise.all([
+  const [classifyResult, retrievalResult] = await Promise.all([
     classifyQueryDomain(openai, queryText, conversationHistory),
     retrieveContextForQuery({ openai, queryText, logLabel: 'telegram', conversationHistory }),
   ]);
-  const domain = domainResult;
+  const { domain, intent } = classifyResult;
   timings.classification_ms = elapsedMs(pipelineStart);
   let usedWebFallback = false;
   let retrieval: Awaited<ReturnType<typeof retrieveContextForQuery>> | null = null;
@@ -349,7 +349,7 @@ async function handleQuery(
     } else {
       await sendMessage(chatId, rejectMsg);
     }
-    logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'domain_gate_reject', reason: domain.reason } });
+    logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent } });
     return;
   }
 
@@ -358,6 +358,39 @@ async function handleQuery(
   timings.retrieval_ms = elapsedMs(pipelineStart);
   if (!retrieval.context || !domain.in_domain) {
     usedWebFallback = true;
+  }
+
+  // 1b. Evidence sufficiency check (skip for web fallback)
+  let tgAnswerMode = 'direct_answer';
+  let tgPartialMissingReasons: string[] | undefined;
+
+  if (ragConfig.enableEnhancedRouting && !usedWebFallback && retrieval) {
+    const sufficiency = checkEvidenceSufficiency({
+      chunks: retrieval.chunks,
+      queryText,
+      intent: intent.intent as QueryIntentType,
+      matchThreshold: ragConfig.matchThreshold,
+      minSourceSimilarity: ragConfig.minSourceSimilarity,
+    });
+    console.log(`[SUFFICIENCY][telegram] mode=${sufficiency.mode} confidence=${sufficiency.confidence.toFixed(2)}`);
+
+    if (sufficiency.mode === 'abstain') {
+      clearInterval(typingInterval);
+      tgAnswerMode = 'insufficient_evidence';
+      const closestPart = sufficiency.closest_evidence ? `\n\nClosest section found: ${sufficiency.closest_evidence}` : '';
+      const abstentionMsg = `The uploaded documents do not contain sufficient information to answer this question.\n\n${sufficiency.missing_reasons.join(' ')}${closestPart}`;
+      if (placeholderMsgId) {
+        await editMessageText(chatId, placeholderMsgId, abstentionMsg);
+      } else {
+        await sendMessage(chatId, abstentionMsg);
+      }
+      await supabase.from('chat_messages').insert({ user_id: userId, query: queryText, response: abstentionMsg, sources: [] });
+      logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'insufficient_evidence', intent: intent.intent, answer_mode: tgAnswerMode, chunks_retrieved: retrieval.chunks.length } });
+      return;
+    } else if (sufficiency.mode === 'partial_answer') {
+      tgAnswerMode = 'partial_answer';
+      tgPartialMissingReasons = sufficiency.missing_reasons;
+    }
   }
 
   // Show progress: update placeholder now that retrieval is done
@@ -372,6 +405,8 @@ async function handleQuery(
     'client',
     usedWebFallback,
     referenceMap,
+    ragConfig.enableEnhancedRouting ? intent.intent : undefined,
+    tgPartialMissingReasons,
   );
 
   // Stop typing interval — we're about to stream
@@ -507,14 +542,20 @@ async function handleQuery(
   });
   timings.chat_save_ms = elapsedMs(saveStart);
 
+  const tgOutcome = tgAnswerMode === 'partial_answer'
+    ? 'partial_answer'
+    : usedWebFallback
+      ? (domain.in_domain ? 'no_chunks' : 'web_fallback')
+      : ((noDirectAnswer || lowRelevance) ? 'no_direct_answer_in_docs' : 'success');
+
   logQueryAnalytics({
     userId,
     queryText,
     responseTimeMs: responseTime,
     metadata: {
-      outcome: usedWebFallback
-        ? (domain.in_domain ? 'no_chunks' : 'web_fallback')
-        : ((noDirectAnswer || lowRelevance) ? 'no_direct_answer_in_docs' : 'success'),
+      outcome: tgOutcome,
+      intent: intent.intent,
+      answer_mode: tgAnswerMode,
       rewritten_query: retrieval?.rewrittenQuery ?? null,
       chunks_retrieved: retrieval?.chunks.length ?? 0,
       source_count: retrieval?.sources.length ?? 0,
@@ -522,7 +563,7 @@ async function handleQuery(
   });
 
   console.log(
-    `[PERF][telegram] total_ms=${responseTime} classification_ms=${timings.classification_ms ?? 0} retrieval_ms=${timings.retrieval_ms ?? 0} prompt_build_ms=${timings.prompt_build_ms ?? 0} llm_ms=${timings.llm_ms ?? 0} citation_mapping_ms=${timings.citation_mapping_ms ?? 0} chat_save_ms=${timings.chat_save_ms ?? 0} outcome=${usedWebFallback ? (domain.in_domain ? 'no_chunks' : 'web_fallback') : ((noDirectAnswer || lowRelevance) ? 'no_direct_answer_in_docs' : 'success')} chunks=${retrieval?.chunks.length ?? 0} sources=${retrieval?.sources.length ?? 0}`
+    `[PERF][telegram] total_ms=${responseTime} classification_ms=${timings.classification_ms ?? 0} retrieval_ms=${timings.retrieval_ms ?? 0} llm_ms=${timings.llm_ms ?? 0} citation_mapping_ms=${timings.citation_mapping_ms ?? 0} chat_save_ms=${timings.chat_save_ms ?? 0} outcome=${tgOutcome} intent=${intent.intent} answer_mode=${tgAnswerMode} chunks=${retrieval?.chunks.length ?? 0} sources=${retrieval?.sources.length ?? 0}`
   );
 }
 
