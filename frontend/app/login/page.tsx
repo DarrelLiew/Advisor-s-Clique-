@@ -50,14 +50,6 @@ export default function LoginPage() {
         <div className='bg-white rounded-2xl shadow-xl p-8 space-y-8'>
           {/* Logo */}
           <div className='flex flex-col items-center'>
-            <Image
-              src='/AC_LogoName_Gold_Primary.png'
-              alt='Advisors Clique Collective'
-              width={200}
-              height={56}
-              className='mb-6 object-contain'
-              priority
-            />
             <h2 className='text-center text-2xl font-semibold font-heading text-foreground'>
               Sign in to your account
             </h2>

@@ -556,14 +556,7 @@ export default function ChatPage() {
       <div className='w-64 shrink-0 bg-[#141414] border-r border-[#2B2B2B] flex flex-col'>
         {/* Logo */}
         <div className='px-4 pt-5 pb-4 flex justify-center'>
-          <Image
-            src='/AC_LogoName_Gold_Primary.png'
-            alt='Advisors Clique Collective'
-            width={180}
-            height={50}
-            className='object-contain'
-            priority
-          />
+          {/* Brand logo removed */}
         </div>
 
         {/* Sidebar header */}

@@ -152,11 +152,6 @@ export default function SetPasswordPage() {
         <div className='bg-white rounded-2xl shadow-xl p-8 space-y-8'>
           {/* Logo */}
           <div className='flex flex-col items-center'>
-            <img
-              src='/AC_LogoName_Gold_Primary.png'
-              alt='Advisors Clique'
-              className='h-12 mb-6'
-            />
             <h2 className='text-center text-2xl font-semibold font-heading text-foreground'>
               Set Your Password
             </h2>

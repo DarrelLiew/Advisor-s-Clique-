@@ -35,14 +35,6 @@ export default async function AdminLayout({
       <div className='bg-secondary text-secondary-foreground'>
         <div className='max-w-7xl mx-auto px-6'>
           <nav className='flex items-center gap-6 py-3'>
-            <Image
-              src='/AC_LogoName_Gold_Primary.png'
-              alt='Advisors Clique Collective'
-              width={140}
-              height={40}
-              className='object-contain mr-2'
-              priority
-            />
             <Link
               href='/admin/dashboard'
               className='py-3 border-b-2 border-transparent text-secondary-foreground/70 hover:text-secondary-foreground hover:border-gold transition-colors'
