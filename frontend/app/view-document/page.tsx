@@ -58,7 +58,7 @@ export default function ViewDocumentPage({
           flexShrink: 0,
         }}
       >
-        <span>Advisors Clique — Document Viewer</span>
+        <span>Knowledge Base — Document Viewer</span>
         <a
           href={decodedUrl}
           target="_blank"

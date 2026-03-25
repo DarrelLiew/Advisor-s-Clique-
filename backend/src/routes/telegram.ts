@@ -222,10 +222,10 @@ function resolveSourcesForRefs(
 
 async function handleStart(chatId: number, firstName: string): Promise<void> {
   const welcome =
-    `Welcome to Advisors Clique, ${firstName}!\n\n` +
+    `Welcome to Knowledge Base AI, ${firstName}!\n\n` +
     `I can answer questions about your uploaded documents.\n\n` +
     `Commands:\n` +
-    `/link - Connect your Telegram to your Advisors Clique account\n` +
+    `/link - Connect your Telegram to your account\n` +
     `/help - Show this help message\n\n` +
     `Once linked, just send me your question and I'll search the documents for you.`;
 
@@ -234,7 +234,7 @@ async function handleStart(chatId: number, firstName: string): Promise<void> {
 
 async function handleHelp(chatId: number): Promise<void> {
   const help =
-    `Advisors Clique Bot - Help\n\n` +
+    `Knowledge Base AI Bot - Help\n\n` +
     `How to use:\n` +
     `1. Link your account with /link\n` +
     `2. Send any question about your documents\n` +
@@ -277,7 +277,7 @@ async function handleLink(
   await sendMessage(
     chatId,
     `Link Your Account\n\n` +
-    `Copy the token below and paste it on the Advisors Clique website under Settings > Link Telegram:\n\n` +
+    `Copy the token below and paste it on the website under Settings > Link Telegram:\n\n` +
     `${token}\n\n` +
     `(This token expires in 15 minutes.)`
   );
@@ -297,7 +297,7 @@ async function handleQuery(
   if (profileError || !profile) {
     await sendMessage(
       chatId,
-      'Your Telegram account is not linked to any Advisors Clique account.\n\nUse /link to generate a token and connect your account.'
+      'Your Telegram account is not linked.\n\nUse /link to generate a token and connect your account.'
     );
     return;
   }

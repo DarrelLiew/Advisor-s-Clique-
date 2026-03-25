@@ -15,7 +15,7 @@ const poppins = Poppins({
 });
 
 export const metadata: Metadata = {
-  title: "Advisors Clique - AI Chatbot",
+  title: "Knowledge Base AI Assistant",
   description: "AI-powered document assistant",
 };
 

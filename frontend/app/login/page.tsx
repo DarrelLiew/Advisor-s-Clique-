@@ -54,7 +54,7 @@ export default function LoginPage() {
               Sign in to your account
             </h2>
             <p className='mt-2 text-center text-sm text-muted-foreground'>
-              Advisors Clique AI Assistant
+              Knowledge Base AI Assistant
             </p>
           </div>
 

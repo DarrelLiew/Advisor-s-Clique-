@@ -1,8 +1,8 @@
 {
-  "name": "advisors-clique-chatbot",
+  "name": "knowledge-base-ai-assistant",
   "version": "1.0.0",
   "private": true,
-  "description": "AI Chatbot Platform with RAG",
+  "description": "AI Knowledge Base Assistant with RAG",
   "scripts": {
     "install:all": "npm install && cd frontend && npm install && cd ../backend && npm install",
     "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",

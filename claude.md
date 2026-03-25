@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 # Project Overview
 
-Advisors Clique is a **RAG-powered AI assistant for financial advisors**.
+A **RAG-powered AI knowledge base assistant**.
 
 Users ask questions about uploaded PDF documents and receive answers with page citations.
 
