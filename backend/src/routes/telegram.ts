@@ -349,7 +349,7 @@ async function handleQuery(
     } else {
       await sendMessage(chatId, rejectMsg);
     }
-    logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent } });
+    logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { source: 'telegram', outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent } });
     return;
   }
 
@@ -385,7 +385,7 @@ async function handleQuery(
         await sendMessage(chatId, abstentionMsg);
       }
       await supabase.from('chat_messages').insert({ user_id: userId, query: queryText, response: abstentionMsg, sources: [] });
-      logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { outcome: 'insufficient_evidence', intent: intent.intent, answer_mode: tgAnswerMode, chunks_retrieved: retrieval.chunks.length } });
+      logQueryAnalytics({ userId, queryText, responseTimeMs: Date.now() - startTime, metadata: { source: 'telegram', outcome: 'insufficient_evidence', intent: intent.intent, answer_mode: tgAnswerMode, chunks_retrieved: retrieval.chunks.length } });
       return;
     } else if (sufficiency.mode === 'partial_answer') {
       tgAnswerMode = 'partial_answer';
@@ -553,6 +553,7 @@ async function handleQuery(
     queryText,
     responseTimeMs: responseTime,
     metadata: {
+      source: 'telegram',
       outcome: tgOutcome,
       intent: intent.intent,
       answer_mode: tgAnswerMode,

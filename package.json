@@ -12,9 +12,11 @@
     "type-check": "cd frontend && npm run type-check && cd ../backend && npm run type-check"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "playwright": "^1.60.0"
   },
   "dependencies": {
-    "@supabase/mcp-server-supabase": "^0.6.3"
+    "@supabase/mcp-server-supabase": "^0.6.3",
+    "cp": "^0.2.0"
   }
 }
