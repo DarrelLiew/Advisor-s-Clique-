@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { AdminShell } from "./AdminShell";
+import Link from "next/link";
+import Image from "next/image";
 
 export default async function AdminLayout({
   children,
@@ -28,13 +29,40 @@ export default async function AdminLayout({
     redirect("/chat");
   }
 
-  // Get user's display name
-  const fullName = user.user_metadata?.full_name || user.email?.split("@")[0] || "Admin";
-  const firstName = fullName.split(" ")[0];
-
   return (
-    <AdminShell userName={fullName} userRole="Administrator" firstName={firstName}>
+    <div className='min-h-screen bg-muted'>
+      {/* Navigation - visible on all admin pages */}
+      <div className='bg-secondary text-secondary-foreground'>
+        <div className='max-w-7xl mx-auto px-6'>
+          <nav className='flex items-center gap-6 py-3'>
+            <Link
+              href='/admin/dashboard'
+              className='py-3 border-b-2 border-transparent text-secondary-foreground/70 hover:text-secondary-foreground hover:border-gold transition-colors'
+            >
+              Dashboard
+            </Link>
+            <Link
+              href='/chat'
+              className='py-3 border-b-2 border-transparent text-secondary-foreground/70 hover:text-secondary-foreground hover:border-gold transition-colors'
+            >
+              Chat
+            </Link>
+            <Link
+              href='/admin/documents'
+              className='py-3 border-b-2 border-transparent text-secondary-foreground/70 hover:text-secondary-foreground hover:border-gold transition-colors'
+            >
+              Documents
+            </Link>
+            <Link
+              href='/admin/users'
+              className='py-3 border-b-2 border-transparent text-secondary-foreground/70 hover:text-secondary-foreground hover:border-gold transition-colors'
+            >
+              Users
+            </Link>
+          </nav>
+        </div>
+      </div>
       {children}
-    </AdminShell>
+    </div>
   );
 }

@@ -507,7 +507,7 @@ router.post(
           userId,
           queryText: query,
           responseTimeMs: responseTime,
-          metadata: { source: 'web', outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent },
+          metadata: { outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent },
         });
 
         return res.json({ answer: rejectionMsg, sources: [], response_time_ms: responseTime, chat_saved: true, intent: intent.intent, answer_mode: 'rejected' });
@@ -563,7 +563,6 @@ router.post(
           queryText: query,
           responseTimeMs: responseTime,
           metadata: {
-            source: 'web',
             outcome: 'insufficient_evidence',
             intent: intent.intent,
             answer_mode: answerMode,
@@ -648,7 +647,6 @@ router.post(
         queryText: query,
         responseTimeMs: responseTime,
         metadata: {
-          source: 'web',
           outcome: analyticsOutcome,
           intent: intent.intent,
           answer_mode: answerMode,
@@ -861,7 +859,6 @@ router.post(
           queryText: query,
           responseTimeMs: responseTime,
           metadata: {
-            source: 'web',
             outcome: 'success',
             answer_mode: 'agent',
             stop_reason: agentResult.stopReason,
@@ -928,7 +925,7 @@ router.post(
           userId,
           queryText: query,
           responseTimeMs: responseTime,
-          metadata: { source: 'web', outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent },
+          metadata: { outcome: 'domain_gate_reject', reason: domain.reason, intent: intent.intent },
         });
 
         writeEvent({
@@ -1000,7 +997,7 @@ router.post(
             userId,
             queryText: query,
             responseTimeMs: elapsedMs(startTime),
-            metadata: { source: 'web', outcome: 'insufficient_evidence', intent: intent.intent, answer_mode: streamAnswerMode, chunks_retrieved: retrieval.chunks.length },
+            metadata: { outcome: 'insufficient_evidence', intent: intent.intent, answer_mode: streamAnswerMode, chunks_retrieved: retrieval.chunks.length },
           });
           writeEvent({ type: 'final', answer: abstentionAnswer, sources: [], response_time_ms: elapsedMs(startTime), chat_saved: true, intent: intent.intent, answer_mode: streamAnswerMode });
           res.end();
@@ -1106,7 +1103,6 @@ router.post(
         queryText: query,
         responseTimeMs: responseTime,
         metadata: {
-          source: 'web',
           outcome: analyticsOutcome,
           intent: intent.intent,
           answer_mode: streamAnswerMode,

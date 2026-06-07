@@ -114,16 +114,16 @@ export default function UsersPage() {
   };
 
   return (
-    <div className='max-w-5xl mx-auto px-4 sm:px-6 py-6 sm:py-8'>
+    <div className='max-w-5xl mx-auto px-6 py-8'>
       <div className='mb-6'>
-        <h2 className='text-xl sm:text-2xl font-bold font-heading mb-2'>User Management</h2>
-        <p className='text-sm sm:text-base text-gray-600'>
+        <h2 className='text-2xl font-bold font-heading mb-2'>User Management</h2>
+        <p className='text-gray-600'>
           Invite new users and manage existing accounts
         </p>
       </div>
 
       {/* Create User Form */}
-      <div className='bg-white rounded-lg shadow-sm border p-4 sm:p-6 mb-6 sm:mb-8'>
+      <div className='bg-white rounded-lg shadow-sm border p-6 mb-8'>
         <h3 className='text-lg font-semibold mb-4 flex items-center gap-2'>
           <UserPlus className='w-5 h-5' />
           Invite New User

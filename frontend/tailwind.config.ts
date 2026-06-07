@@ -11,7 +11,6 @@ const config: Config = {
       fontFamily: {
         sans: ['var(--font-inter)', 'Inter', 'system-ui', 'sans-serif'],
         heading: ['var(--font-poppins)', 'Poppins', 'system-ui', 'sans-serif'],
-        display: ['var(--font-cormorant)', 'Georgia', 'serif'],
       },
       colors: {
         border: 'hsl(var(--border))',
@@ -47,18 +46,6 @@ const config: Config = {
         charcoal: '#1F1F1F',
         'dark-bg': '#0A0A0A',
         'dark-surface': '#141414',
-        chart: {
-          navy: '#1F3A68',
-          teal: '#2E8B7A',
-          coral: '#C0654E',
-          violet: '#6B5B95',
-          sage: '#84A26B',
-        },
-        status: {
-          pos: '#1F7A5A',
-          neg: '#B23A48',
-          warn: '#C8961A',
-        },
       },
       borderRadius: {
         lg: 'var(--radius)',
@@ -71,9 +58,6 @@ const config: Config = {
       boxShadow: {
         'gold-glow': '0 0 10px rgba(201,162,74,0.2)',
         'gold-glow-lg': '0 0 20px rgba(201,162,74,0.3)',
-        'card': '0 1px 2px rgba(15,21,37,0.04), 0 2px 8px rgba(15,21,37,0.04)',
-        'pop': '0 8px 28px rgba(15,21,37,0.10)',
-        'cta': '0 1px 2px rgba(15,21,37,0.18)',
       },
     },
   },

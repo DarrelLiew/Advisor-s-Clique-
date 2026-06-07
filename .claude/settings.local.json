@@ -2,11 +2,7 @@
   "permissions": {
     "allow": [
       "mcp__supabase__execute_sql",
-      "mcp__supabase__apply_migration",
-      "Bash(tree:*)",
-      "Bash(npx playwright install:*)",
-      "Bash(node capture-screenshots.js:*)",
-      "Bash(node capture-mobile-screenshots.js:*)"
+      "mcp__supabase__apply_migration"
     ]
   },
   "enableAllProjectMcpServers": true,

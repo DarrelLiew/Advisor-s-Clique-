@@ -12,8 +12,6 @@ import {
   Plus,
   Trash2,
   MessageSquare,
-  Menu,
-  X,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
@@ -264,7 +262,6 @@ export default function ChatPage() {
   const [showNewSessionModal, setShowNewSessionModal] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const supabase = createClient();
@@ -322,7 +319,6 @@ export default function ChatPage() {
     setActiveSession(session);
     setMessages([]);
     setLoadingHistory(true);
-    setSidebarOpen(false); // Close sidebar on mobile when selecting a session
     try {
       const data = await api.get<{ messages: Message[] }>(
         `/api/chat/history?session_id=${session.id}&limit=50`,
@@ -554,31 +550,10 @@ export default function ChatPage() {
 
   return (
     <div className='flex h-screen bg-[#0F0F0F] overflow-hidden'>
-      {/* Mobile sidebar overlay */}
-      {sidebarOpen && (
-        <div
-          className='fixed inset-0 bg-black/60 z-40 lg:hidden'
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
-
       {/* ------------------------------------------------------------------ */}
       {/* Sidebar */}
       {/* ------------------------------------------------------------------ */}
-      <div
-        className={`fixed lg:relative inset-y-0 left-0 z-50 w-64 shrink-0 bg-[#141414] border-r border-[#2B2B2B] flex flex-col transform transition-transform duration-300 ease-in-out lg:transform-none ${
-          sidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'
-        }`}
-      >
-        {/* Mobile close button */}
-        <button
-          type='button'
-          onClick={() => setSidebarOpen(false)}
-          className='absolute top-4 right-4 p-1 text-gray-400 hover:text-white lg:hidden'
-          aria-label='Close sidebar'
-        >
-          <X className='w-5 h-5' />
-        </button>
+      <div className='w-64 shrink-0 bg-[#141414] border-r border-[#2B2B2B] flex flex-col'>
         {/* Logo */}
         <div className='px-4 pt-5 pb-4 flex justify-center'>
           {/* Brand logo removed */}
@@ -674,17 +649,8 @@ export default function ChatPage() {
       {/* ------------------------------------------------------------------ */}
       <div className='flex-1 flex flex-col min-w-0'>
         {/* Header */}
-        <div className='bg-[#1F1F1F] text-white border-b border-[#2B2B2B] px-4 sm:px-6 py-4 flex justify-between items-center shrink-0'>
-          <div className='flex items-center gap-3 sm:gap-4'>
-            {/* Mobile hamburger menu */}
-            <button
-              type='button'
-              onClick={() => setSidebarOpen(true)}
-              className='p-1 text-gray-400 hover:text-white lg:hidden'
-              aria-label='Open sidebar'
-            >
-              <Menu className='w-6 h-6' />
-            </button>
+        <div className='bg-[#1F1F1F] text-white border-b border-[#2B2B2B] px-6 py-4 flex justify-between items-center shrink-0'>
+          <div className='flex items-center gap-4'>
             {isAdmin && (
               <Link
                 href='/admin/dashboard'
