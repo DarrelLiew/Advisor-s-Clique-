@@ -156,7 +156,7 @@ export default function SetPasswordPage() {
               Set Your Password
             </h2>
             <p className='mt-2 text-center text-sm text-muted-foreground'>
-              Welcome! Create a password to access your
+              Welcome to Advisors Clique! Create a password to access your
               account.
             </p>
           </div>
